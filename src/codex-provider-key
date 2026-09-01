@@ -1,0 +1,31 @@
+#!/opt/homebrew/bin/python3
+"""Print exactly one configured provider key for Codex's auth command."""
+
+from __future__ import annotations
+
+import json
+import os
+from pathlib import Path
+import sys
+
+
+CODEX_HOME = Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex"))).expanduser()
+CREDENTIALS_PATH = CODEX_HOME / "provider-credentials.json"
+KNOWN_PROVIDERS = {"codex-sale", "vibecode", "anymodel", "a6api", "openrouter"}
+
+
+def main() -> None:
+    if len(sys.argv) != 2 or sys.argv[1] not in KNOWN_PROVIDERS:
+        raise SystemExit("Укажите известного провайдера.")
+    try:
+        credentials = json.loads(CREDENTIALS_PATH.read_text(encoding="utf-8"))
+        key = credentials[sys.argv[1]]
+    except (FileNotFoundError, KeyError, json.JSONDecodeError) as error:
+        raise SystemExit("Ключ провайдера не настроен.") from error
+    if not isinstance(key, str) or not key.strip():
+        raise SystemExit("Ключ провайдера пустой.")
+    sys.stdout.write(key.strip())
+
+
+if __name__ == "__main__":
+    main()

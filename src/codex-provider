@@ -1,0 +1,390 @@
+#!/opt/homebrew/bin/python3
+"""Switch Codex custom model providers without changing their display name."""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import sys
+import tempfile
+import tomllib
+
+
+CODEX_HOME = Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex"))).expanduser()
+CONFIG_PATH = CODEX_HOME / "config.toml"
+KEY_HELPER = CODEX_HOME / "bin" / "codex-provider-key"
+CREDENTIALS_PATH = CODEX_HOME / "provider-credentials.json"
+AUTH_PATH = CODEX_HOME / "auth.json"
+BACKUPS_PATH = CODEX_HOME / "backups"
+DISPLAY_NAME = "OpenAI"
+# Codex writes this identifier into every session. It must remain stable so
+# switching the upstream service does not split new sessions into groups.
+SESSION_PROVIDER_ID = "codex-sale"
+
+PROVIDERS = {
+    "codex-sale": {
+        "label": "Codex Sale",
+        "base_url": "https://codex.sale/backend-api/codex",
+        "supports_websockets": True,
+        "model": "gpt-5.6-terra",
+        "reasoning": "high",
+    },
+    "vibecode": {
+        "label": "VibeCode",
+        "base_url": "https://vibecode.moe/v1",
+        "supports_websockets": False,
+        "model": "gpt-5.6-terra",
+        "reasoning": "high",
+    },
+    "anymodel": {
+        "label": "AnyModel",
+        "base_url": "https://anymodel.org/v1",
+        "supports_websockets": False,
+        "model": "gpt-5.6-terra",
+        "reasoning": "high",
+    },
+    "a6api": {
+        "label": "A6 API",
+        "base_url": "https://api.a6api.com/v1",
+        "supports_websockets": False,
+        "model": "gpt-5.6-terra",
+        "reasoning": "high",
+    },
+    "openrouter": {
+        "label": "OpenRouter — Ox Alpha",
+        "base_url": "https://openrouter.ai/api/v1",
+        "supports_websockets": False,
+        "model": "stealth/ox-alpha",
+        "reasoning": "max",
+    },
+}
+
+
+def toml_string(value: str) -> str:
+    return json.dumps(value, ensure_ascii=False)
+
+
+def table_header(line: str) -> str | None:
+    stripped = line.strip()
+    if not (stripped.startswith("[") and stripped.endswith("]")):
+        return None
+    return stripped.strip("[]").replace('"', "").replace("'", "").replace(" ", "")
+
+
+def is_provider_table(header: str | None) -> bool:
+    if header is None:
+        return False
+    return any(header == f"model_providers.{name}" or header.startswith(f"model_providers.{name}.") for name in PROVIDERS)
+
+
+def remove_managed_provider_blocks(text: str) -> str:
+    kept: list[str] = []
+    skipping = False
+    for line in text.splitlines(keepends=True):
+        header = table_header(line)
+        if header is not None:
+            skipping = is_provider_table(header)
+        if not skipping:
+            kept.append(line)
+    return "".join(kept).rstrip() + "\n"
+
+
+def provider_block(target_id: str) -> str:
+    provider = PROVIDERS[target_id]
+    lines = [
+        f"[model_providers.{SESSION_PROVIDER_ID}]",
+        f"name = {toml_string(DISPLAY_NAME)}",
+        f"base_url = {toml_string(provider['base_url'])}",
+        'wire_api = "responses"',
+    ]
+    if provider["supports_websockets"]:
+        lines.append("supports_websockets = true")
+    else:
+        lines.append("supports_websockets = false")
+    if target_id == SESSION_PROVIDER_ID:
+        # Match Codex Sale's own installer: it authenticates through auth.json.
+        lines.extend(
+            [
+                'env_key = "CODEX_LB_API_KEY"',
+                "requires_openai_auth = true",
+            ]
+        )
+    else:
+        lines.extend(
+            [
+                "",
+                f"[model_providers.{SESSION_PROVIDER_ID}.auth]",
+                f"command = {toml_string(str(KEY_HELPER))}",
+                f"args = [{toml_string(target_id)}]",
+            ]
+        )
+    return "\n".join(lines)
+
+
+def active_service(config: dict) -> str:
+    """Return the selected upstream service, even with the stable session ID."""
+    providers = config.get("model_providers", {})
+    if isinstance(providers, dict):
+        stable_provider = providers.get(SESSION_PROVIDER_ID, {})
+        if isinstance(stable_provider, dict):
+            auth = stable_provider.get("auth", {})
+            args = auth.get("args", []) if isinstance(auth, dict) else []
+            if args and args[0] in PROVIDERS:
+                return args[0]
+            base_url = stable_provider.get("base_url")
+            for provider_id, provider in PROVIDERS.items():
+                if provider["base_url"] == base_url:
+                    return provider_id
+
+    configured_id = config.get("model_provider")
+    if configured_id in PROVIDERS:
+        return configured_id
+    return SESSION_PROVIDER_ID
+
+
+def configured_text(text: str, target_id: str | None = None) -> str:
+    if target_id is None:
+        try:
+            target_id = active_service(tomllib.loads(text))
+        except tomllib.TOMLDecodeError:
+            target_id = SESSION_PROVIDER_ID
+    if target_id not in PROVIDERS:
+        raise SystemExit(f"Неизвестный сервис: {target_id}")
+    base = remove_managed_provider_blocks(text)
+    base = update_top_level(base, {"model_provider": SESSION_PROVIDER_ID})
+    return base.rstrip() + "\n\n" + provider_block(target_id) + "\n"
+
+
+def update_top_level(text: str, values: dict[str, str]) -> str:
+    lines = text.splitlines(keepends=True)
+    first_table = next((index for index, line in enumerate(lines) if table_header(line) is not None), len(lines))
+    prefix = lines[:first_table]
+    suffix = lines[first_table:]
+    found: set[str] = set()
+
+    for index, line in enumerate(prefix):
+        for key, value in values.items():
+            if re.match(rf"^\s*{re.escape(key)}\s*=", line):
+                ending = "\n" if line.endswith("\n") else ""
+                prefix[index] = f"{key} = {toml_string(value)}{ending}"
+                found.add(key)
+                break
+
+    missing = [key for key in values if key not in found]
+    if missing:
+        if prefix and prefix[-1].strip():
+            prefix.append("\n")
+        prefix.extend(f"{key} = {toml_string(values[key])}\n" for key in missing)
+        if suffix and prefix[-1].strip():
+            prefix.append("\n")
+    return "".join(prefix + suffix)
+
+
+def validate_toml(text: str) -> None:
+    try:
+        tomllib.loads(text)
+    except tomllib.TOMLDecodeError as error:
+        raise SystemExit(f"Не меняю настройки: итоговый config.toml не проходит проверку ({error}).") from error
+
+
+def create_backup() -> Path:
+    BACKUPS_PATH.mkdir(parents=True, exist_ok=True)
+    stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+    target = BACKUPS_PATH / f"before-codex-provider-cli-{stamp}"
+    target.mkdir(mode=0o700)
+    if CONFIG_PATH.exists():
+        shutil.copy2(CONFIG_PATH, target / "config.toml")
+    return target
+
+
+def write_config(text: str, *, backup: bool) -> Path | None:
+    validate_toml(text)
+    backup_path = create_backup() if backup else None
+    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(prefix="config.toml.", dir=CONFIG_PATH.parent)
+    temporary_path = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as output:
+            output.write(text)
+        os.chmod(temporary_path, 0o600)
+        os.replace(temporary_path, CONFIG_PATH)
+    finally:
+        if temporary_path.exists():
+            temporary_path.unlink()
+    return backup_path
+
+
+def write_codex_sale_auth(api_key: str, backup_path: Path) -> None:
+    """Store the active Codex Sale key in the auth file its proxy expects."""
+    if AUTH_PATH.exists():
+        shutil.copy2(AUTH_PATH, backup_path / "auth.json")
+    descriptor, temporary_name = tempfile.mkstemp(prefix="auth.json.", dir=AUTH_PATH.parent)
+    temporary_path = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as output:
+            json.dump({"auth_mode": "apikey", "OPENAI_API_KEY": api_key}, output, indent=2)
+            output.write("\n")
+        os.chmod(temporary_path, 0o600)
+        os.replace(temporary_path, AUTH_PATH)
+    finally:
+        if temporary_path.exists():
+            temporary_path.unlink()
+
+
+def ensure_provider_definitions(*, backup: bool) -> Path | None:
+    if not CONFIG_PATH.exists():
+        raise SystemExit(f"Не найден основной файл настроек: {CONFIG_PATH}")
+    current = CONFIG_PATH.read_text(encoding="utf-8")
+    updated = configured_text(current)
+    if updated == current:
+        return None
+    return write_config(updated, backup=backup)
+
+
+def load_config() -> dict:
+    if not CONFIG_PATH.exists():
+        raise SystemExit(f"Не найден основной файл настроек: {CONFIG_PATH}")
+    try:
+        return tomllib.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+    except tomllib.TOMLDecodeError as error:
+        raise SystemExit(f"Не могу прочитать config.toml: {error}") from error
+
+
+def load_credentials() -> dict[str, str]:
+    try:
+        data = json.loads(CREDENTIALS_PATH.read_text(encoding="utf-8"))
+    except FileNotFoundError as error:
+        raise SystemExit("Не найден файл ключей. Выполните: codex-provider set-key <провайдер>") from error
+    except json.JSONDecodeError as error:
+        raise SystemExit(f"Файл ключей повреждён: {error}") from error
+    return {key: value for key, value in data.items() if isinstance(value, str)}
+
+
+def save_credentials(credentials: dict[str, str]) -> None:
+    CREDENTIALS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(prefix="provider-credentials.", dir=CREDENTIALS_PATH.parent)
+    temporary_path = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as output:
+            json.dump(credentials, output, ensure_ascii=False, indent=2)
+            output.write("\n")
+        os.chmod(temporary_path, 0o600)
+        os.replace(temporary_path, CREDENTIALS_PATH)
+    finally:
+        if temporary_path.exists():
+            temporary_path.unlink()
+
+
+def command_list(_: argparse.Namespace) -> None:
+    config = load_config()
+    active = active_service(config)
+    credentials = load_credentials()
+    print(f"Единый идентификатор новых сессий: {SESSION_PROVIDER_ID}")
+    for provider_id, provider in PROVIDERS.items():
+        marker = "*" if provider_id == active else " "
+        key_status = "ключ сохранён" if credentials.get(provider_id) else "нет ключа"
+        print(f"{marker} {provider_id:12} — {provider['label']}, {key_status}")
+
+
+def command_current(_: argparse.Namespace) -> None:
+    config = load_config()
+    provider_id = active_service(config)
+    print(f"Текущий сервис: {provider_id}")
+    print(f"Модель: {config.get('model', 'не задана')}")
+    print(f"Идентификатор новых сессий: {SESSION_PROVIDER_ID}")
+
+
+def command_install(_: argparse.Namespace) -> None:
+    active = active_service(load_config())
+    api_key = load_credentials().get(SESSION_PROVIDER_ID) if active == SESSION_PROVIDER_ID else None
+    if active == SESSION_PROVIDER_ID and not api_key:
+        raise SystemExit("Не найден ключ Codex Sale.")
+    backup_path = ensure_provider_definitions(backup=True)
+    if active == SESSION_PROVIDER_ID:
+        if backup_path is None:
+            backup_path = create_backup()
+        write_codex_sale_auth(api_key, backup_path)
+    if backup_path is None:
+        print("Провайдеры уже настроены.")
+    else:
+        print("Провайдеры добавлены. Идентификатор сессий: codex-sale.")
+        print(f"Резервная копия: {backup_path}")
+
+
+def command_use(args: argparse.Namespace) -> None:
+    api_key = load_credentials().get(SESSION_PROVIDER_ID) if args.provider == SESSION_PROVIDER_ID else None
+    if args.provider == SESSION_PROVIDER_ID and not api_key:
+        raise SystemExit("Не найден ключ Codex Sale.")
+    current = CONFIG_PATH.read_text(encoding="utf-8")
+    values = {"model_provider": SESSION_PROVIDER_ID}
+    if not args.keep_model:
+        provider = PROVIDERS[args.provider]
+        values["model"] = provider["model"]
+        values["model_reasoning_effort"] = provider["reasoning"]
+    updated = update_top_level(configured_text(current, args.provider), values)
+    if updated != current:
+        backup_path = write_config(updated, backup=True)
+    else:
+        backup_path = create_backup() if args.provider == SESSION_PROVIDER_ID else None
+    if args.provider == SESSION_PROVIDER_ID:
+        write_codex_sale_auth(api_key, backup_path)
+    print(f"Активен: {args.provider}. Идентификатор новых сессий остаётся codex-sale.")
+    if not args.keep_model:
+        print(f"Выбрана совместимая модель: {PROVIDERS[args.provider]['model']}.")
+    if backup_path:
+        print(f"Резервная копия: {backup_path}")
+    print("Перезапустите Codex или начните новую сессию, чтобы настройка применилась.")
+
+
+def command_set_key(args: argparse.Namespace) -> None:
+    import getpass
+
+    key = getpass.getpass(f"Введите новый ключ для {args.provider}: ").strip()
+    if not key:
+        raise SystemExit("Ключ не введён, ничего не изменено.")
+    credentials = load_credentials() if CREDENTIALS_PATH.exists() else {}
+    credentials[args.provider] = key
+    save_credentials(credentials)
+    print(f"Ключ для {args.provider} сохранён в закрытом файле.")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="codex-provider",
+        description="Переключение между настроенными провайдерами Codex.",
+    )
+    subcommands = parser.add_subparsers(dest="command", required=True)
+
+    install = subcommands.add_parser("install", help="добавить или обновить настройки провайдеров")
+    install.set_defaults(handler=command_install)
+
+    listing = subcommands.add_parser("list", help="показать провайдеров")
+    listing.set_defaults(handler=command_list)
+
+    current = subcommands.add_parser("current", help="показать текущего провайдера")
+    current.set_defaults(handler=command_current)
+
+    use = subcommands.add_parser("use", help="переключить провайдера")
+    use.add_argument("provider", choices=PROVIDERS.keys())
+    use.add_argument("--keep-model", action="store_true", help="не менять текущую модель")
+    use.set_defaults(handler=command_use)
+
+    set_key = subcommands.add_parser("set-key", help="безопасно заменить ключ провайдера")
+    set_key.add_argument("provider", choices=PROVIDERS.keys())
+    set_key.set_defaults(handler=command_set_key)
+    return parser
+
+
+def main() -> None:
+    parser = build_parser()
+    arguments = parser.parse_args()
+    arguments.handler(arguments)
+
+
+if __name__ == "__main__":
+    main()
