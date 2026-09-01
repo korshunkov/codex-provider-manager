@@ -20,6 +20,7 @@ from provider_models import (
     fetch_models,
     find_model,
     load_state,
+    merge_reasoning_from_reference,
     remember_model,
     save_state,
     search_models,
@@ -300,13 +301,30 @@ def save_credentials(credentials: dict[str, str]) -> None:
 def available_models(provider_id: str, *, force: bool = False) -> list[dict]:
     credentials = load_credentials()
     try:
-        return fetch_models(
+        models = fetch_models(
             provider_id,
             PROVIDERS[provider_id],
             credentials.get(provider_id),
             MODEL_CACHE_PATH,
             force=force,
         )
+        if provider_id == "a6api":
+            # A6 does not publish reasoning capabilities for every model.
+            # OpenRouter is used only as a metadata reference; it does not
+            # change the provider endpoint or the models shown for A6.
+            try:
+                reference_models = fetch_models(
+                    "openrouter-reference",
+                    PROVIDERS["openrouter"],
+                    credentials.get("openrouter"),
+                    MODEL_CACHE_PATH,
+                    force=force,
+                    cache_id="openrouter-reference",
+                )
+                models = merge_reasoning_from_reference(models, reference_models)
+            except RuntimeError:
+                pass
+        return models
     except RuntimeError as error:
         provider = PROVIDERS[provider_id]
         return [

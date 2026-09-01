@@ -173,6 +173,38 @@ def normalize_model(provider_id: str, item: dict[str, Any]) -> dict[str, Any] | 
     }
 
 
+def merge_reasoning_from_reference(
+    models: list[dict[str, Any]], reference_models: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Fill missing reasoning metadata using an unambiguous model-name match."""
+    by_short_name: dict[str, list[dict[str, Any]]] = {}
+    for reference in reference_models:
+        short_name = reference["id"].rsplit("/", 1)[-1].casefold()
+        by_short_name.setdefault(short_name, []).append(reference)
+
+    enriched = []
+    for model in models:
+        if len(model["reasoning_levels"]) == 1 and model["reasoning_levels"] == ["medium"]:
+            short_name = model["id"].rsplit("/", 1)[-1].casefold()
+            matches = by_short_name.get(short_name, [])
+            if len(matches) != 1:
+                # OpenRouter exposes billing variants such as :batch and
+                # :free; the plain model is the canonical metadata source.
+                canonical = [
+                    reference
+                    for reference in matches
+                    if ":" not in reference["id"].rsplit("/", 1)[-1]
+                ]
+                if len(canonical) == 1:
+                    matches = canonical
+            if len(matches) == 1 and len(matches[0]["reasoning_levels"]) > 1:
+                model = dict(model)
+                model["reasoning_levels"] = list(matches[0]["reasoning_levels"])
+                model["default_reasoning_level"] = matches[0]["default_reasoning_level"]
+        enriched.append(model)
+    return enriched
+
+
 def fetch_models(
     provider_id: str,
     provider: dict[str, Any],
@@ -180,9 +212,11 @@ def fetch_models(
     cache_path: Path,
     *,
     force: bool = False,
+    cache_id: str | None = None,
 ) -> list[dict[str, Any]]:
+    cache_id = cache_id or provider_id
     cache = load_json(cache_path, {})
-    cached = cache.get(provider_id, {}) if isinstance(cache, dict) else {}
+    cached = cache.get(cache_id, {}) if isinstance(cache, dict) else {}
     cached_models = cached.get("models", []) if isinstance(cached, dict) else []
     fetched_at = cached.get("fetched_at", 0) if isinstance(cached, dict) else 0
     now = dt.datetime.now(tz=dt.timezone.utc).timestamp()
@@ -215,7 +249,7 @@ def fetch_models(
 
     if not isinstance(cache, dict):
         cache = {}
-    cache[provider_id] = {"fetched_at": now, "models": models}
+    cache[cache_id] = {"fetched_at": now, "models": models}
     _atomic_json_write(cache_path, cache)
     return models
 

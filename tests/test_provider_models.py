@@ -10,6 +10,7 @@ from provider_models import (  # noqa: E402
     _is_free_openrouter_model,
     build_shelf,
     find_model,
+    merge_reasoning_from_reference,
 )
 
 
@@ -46,6 +47,23 @@ class ProviderModelsTests(unittest.TestCase):
         shelf = build_shelf("anymodel", {"model": "vendor/model-2"}, models, state, "vendor/model-40")
         self.assertEqual(len(shelf), SHELF_LIMIT)
         self.assertEqual(shelf[0]["id"], "vendor/model-40")
+
+    def test_reasoning_can_be_filled_from_unique_reference_model(self) -> None:
+        a6_model = model("glm-5.3-flash")
+        reference = model("z-ai/glm-5.3-flash")
+        batch_reference = model("z-ai/glm-5.3-flash:batch")
+        reference["reasoning_levels"] = ["low", "medium", "high"]
+        reference["default_reasoning_level"] = "medium"
+        enriched = merge_reasoning_from_reference([a6_model], [reference, batch_reference])
+        self.assertEqual(enriched[0]["reasoning_levels"], ["low", "medium", "high"])
+
+    def test_reasoning_reference_requires_unique_match(self) -> None:
+        a6_model = model("glm-5.3-flash")
+        refs = [model("one/glm-5.3-flash"), model("two/glm-5.3-flash")]
+        for ref in refs:
+            ref["reasoning_levels"] = ["low", "medium", "high"]
+        enriched = merge_reasoning_from_reference([a6_model], refs)
+        self.assertEqual(enriched[0]["reasoning_levels"], ["medium"])
 
 
 if __name__ == "__main__":
