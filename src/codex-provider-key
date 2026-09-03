@@ -11,15 +11,16 @@ import sys
 
 CODEX_HOME = Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex"))).expanduser()
 CREDENTIALS_PATH = CODEX_HOME / "provider-credentials.json"
-KNOWN_PROVIDERS = {"codex-sale", "vibecode", "anymodel", "a6api", "openrouter"}
+KNOWN_PROVIDERS = {"codex-sale", "vibecode", "anymodel", "a6api", "openrouter", "openrouter-all"}
 
 
 def main() -> None:
     if len(sys.argv) != 2 or sys.argv[1] not in KNOWN_PROVIDERS:
         raise SystemExit("Укажите известного провайдера.")
+    credential_id = "openrouter" if sys.argv[1] == "openrouter-all" else sys.argv[1]
     try:
         credentials = json.loads(CREDENTIALS_PATH.read_text(encoding="utf-8"))
-        key = credentials[sys.argv[1]]
+        key = credentials[credential_id]
     except (FileNotFoundError, KeyError, json.JSONDecodeError) as error:
         raise SystemExit("Ключ провайдера не настроен.") from error
     if not isinstance(key, str) or not key.strip():
