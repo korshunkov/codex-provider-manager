@@ -98,6 +98,7 @@ struct ModelResponse: Decodable {
 struct ModelTestResponse: Decodable {
     let ok: Bool
     let message: String
+    let attempts: Int?
 }
 
 struct ProviderOption: Hashable, Identifiable {
@@ -272,7 +273,7 @@ final class ModelStore: ObservableObject {
     func testCurrentRow() {
         guard let row = selectedRow else { return }
         isLoading = true
-        status = "Проверяю модель коротким запросом…"
+        status = "Проверяю модель потоковым запросом…"
         let provider = row.providerID ?? providerID
         let arguments = ["test-model", provider, "--model", row.modelID]
 
