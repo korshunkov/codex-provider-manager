@@ -49,6 +49,7 @@ DISPLAY_NAME = "OpenAI"
 # Codex writes this identifier into every session. It must remain stable so
 # switching the upstream service does not split new sessions into groups.
 SESSION_PROVIDER_ID = "codex-sale"
+COMPATIBILITY_TEST_ATTEMPTS = 1
 
 PROVIDERS = {
     "codex-sale": {
@@ -549,6 +550,43 @@ def _provider_error_message(payload: bytes) -> str:
     return text[:500] or "Провайдер не вернул подробности ошибки."
 
 
+def _test_streaming_response(
+    base_url: str,
+    api_key: str,
+    model_id: str,
+    reasoning_effort: str,
+) -> str | None:
+    """Return an error message, or None after a complete streaming response."""
+    request_body = {
+        "model": model_id,
+        "input": "Ответь ровно одним словом: ok",
+        "max_output_tokens": 16,
+        "stream": True,
+        "reasoning": {"effort": reasoning_effort},
+    }
+    request = urllib.request.Request(
+        f"{base_url.rstrip('/')}/responses",
+        data=json.dumps(request_body).encode("utf-8"),
+        headers={
+            "Accept": "text/event-stream",
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}",
+            "User-Agent": "CodexProviderManager/1.0",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=45) as response:
+            payload = response.read()
+        if b"response.completed" not in payload:
+            return "Потоковый ответ оборвался до завершения."
+        return None
+    except urllib.error.HTTPError as error:
+        return f"Провайдер вернул HTTP {error.code}: {_provider_error_message(error.read())}"
+    except (urllib.error.URLError, TimeoutError, OSError) as error:
+        return f"Не удалось связаться с провайдером: {error}"
+
+
 def command_test_model(args: argparse.Namespace) -> None:
     provider_id = args.provider
     models = available_models(provider_id, force=args.refresh)
@@ -567,38 +605,30 @@ def command_test_model(args: argparse.Namespace) -> None:
         "supports_search_tool": selected.get("supports_search_tool"),
         "supports_function_tools": selected.get("supports_function_tools", True),
         "reasoning_levels": selected["reasoning_levels"],
+        "attempts": COMPATIBILITY_TEST_ATTEMPTS,
     }
     if not api_key:
         result["message"] = "Для этого провайдера не найден ключ."
         print(json.dumps(result, ensure_ascii=False))
         return
 
-    request_body = {
-        "model": selected["id"],
-        "input": "Ответь ровно одним словом: ok",
-        "max_output_tokens": 16,
-        "stream": False,
-    }
-    request = urllib.request.Request(
-        f"{str(PROVIDERS[provider_id]['base_url']).rstrip('/')}/responses",
-        data=json.dumps(request_body).encode("utf-8"),
-        headers={
-            "Accept": "application/json",
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {api_key}",
-            "User-Agent": "CodexProviderManager/1.0",
-        },
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(request, timeout=45) as response:
-            response.read(1024)
+    reasoning_effort = selected["default_reasoning_level"]
+    errors: list[str] = []
+    for attempt in range(1, COMPATIBILITY_TEST_ATTEMPTS + 1):
+        error = _test_streaming_response(
+            str(PROVIDERS[provider_id]["base_url"]),
+            api_key,
+            selected["id"],
+            reasoning_effort,
+        )
+        if error:
+            errors.append(f"попытка {attempt}: {error}")
+
+    if errors:
+        result["message"] = f"Потоковый запрос не прошёл: {'; '.join(errors)}"
+    else:
         result["ok"] = True
-        result["message"] = "Модель отвечает на короткий проверочный запрос."
-    except urllib.error.HTTPError as error:
-        result["message"] = f"Провайдер вернул HTTP {error.code}: {_provider_error_message(error.read())}"
-    except (urllib.error.URLError, TimeoutError, OSError) as error:
-        result["message"] = f"Не удалось связаться с провайдером: {error}"
+        result["message"] = "Модель ответила на короткий потоковый запрос."
     print(json.dumps(result, ensure_ascii=False))
 
 
@@ -670,7 +700,7 @@ def build_parser() -> argparse.ArgumentParser:
     models.add_argument("--refresh", action="store_true", help="обновить список с сервера")
     models.set_defaults(handler=command_models)
 
-    test_model = subcommands.add_parser("test-model", help="проверить модель коротким запросом")
+    test_model = subcommands.add_parser("test-model", help="проверить модель потоковым запросом")
     test_model.add_argument("provider", choices=PROVIDERS.keys())
     test_model.add_argument("--model", required=True)
     test_model.add_argument("--refresh", action="store_true", help="обновить метаданные модели")
