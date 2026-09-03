@@ -159,6 +159,28 @@ def _input_modalities(item: dict[str, Any]) -> list[str]:
     return ["text"]
 
 
+def _context_details(provider_id: str, item: dict[str, Any]) -> tuple[int, str]:
+    capabilities = item.get("capabilities") if isinstance(item.get("capabilities"), dict) else {}
+    top_provider = item.get("top_provider") if isinstance(item.get("top_provider"), dict) else {}
+    candidates = (
+        item.get("context_length"),
+        item.get("context_window"),
+        capabilities.get("contextWindow"),
+        capabilities.get("context_window"),
+        top_provider.get("context_length"),
+    )
+    for candidate in candidates:
+        try:
+            context_window = int(candidate)
+        except (TypeError, ValueError):
+            continue
+        if context_window > 0:
+            return max(16000, context_window), "provider"
+    if provider_id in ("a6api", "anymodel"):
+        return 128000, "missing"
+    return 128000, "fallback"
+
+
 def _positive_float(value: Any) -> float | None:
     try:
         number = float(value)
@@ -286,6 +308,7 @@ def merge_a6_marketplace_prices(
 def _with_model_fields(model: dict[str, Any], provider_id: str = "") -> dict[str, Any]:
     """Keep model caches created before pricing metadata readable."""
     model = dict(model)
+    model.setdefault("context_window", 128000)
     model.setdefault("input_price_per_million", None)
     model.setdefault("output_price_per_million", None)
     model.setdefault("intelligence_index", None)
@@ -294,6 +317,10 @@ def _with_model_fields(model: dict[str, Any], provider_id: str = "") -> dict[str
     model.setdefault("price_is_estimate", False)
     model.setdefault("supports_search_tool", None)
     model.setdefault("supports_function_tools", True)
+    if "context_window_source" not in model:
+        # A6 previously stored the generic 128K fallback, so let OpenRouter
+        # replace it. Other legacy caches already contained provider data.
+        model["context_window_source"] = "missing" if provider_id == "a6api" else "provider"
     if provider_id in ("a6api", "anymodel") and "reasoning_levels_source" not in model:
         # Migrate caches created before the source marker was introduced.
         if model.get("reasoning_levels") == ["low", "medium", "high"]:
@@ -330,18 +357,7 @@ def normalize_model(provider_id: str, item: dict[str, Any]) -> dict[str, Any] | 
     if not _model_supports_tools(provider_id, item):
         return None
     levels, default_level, levels_source = _reasoning_details(provider_id, item)
-    capabilities = item.get("capabilities") if isinstance(item.get("capabilities"), dict) else {}
-    top_provider = item.get("top_provider") if isinstance(item.get("top_provider"), dict) else {}
-    context_window = (
-        item.get("context_length")
-        or capabilities.get("contextWindow")
-        or top_provider.get("context_length")
-        or 128000
-    )
-    try:
-        context_window = max(16000, int(context_window))
-    except (TypeError, ValueError):
-        context_window = 128000
+    context_window, context_source = _context_details(provider_id, item)
     display_name = item.get("display_name") or item.get("name") or model_id
     description = item.get("description") or f"Модель {display_name} через выбранного провайдера"
     input_price, output_price = _pricing_details(provider_id, item)
@@ -351,6 +367,7 @@ def normalize_model(provider_id: str, item: dict[str, Any]) -> dict[str, Any] | 
         "display_name": str(display_name),
         "description": str(description),
         "context_window": context_window,
+        "context_window_source": context_source,
         "input_modalities": _input_modalities(item),
         "reasoning_levels": levels,
         "default_reasoning_level": default_level,
@@ -364,6 +381,40 @@ def normalize_model(provider_id: str, item: dict[str, Any]) -> dict[str, Any] | 
         "supports_search_tool": _model_supports_search(item),
         "supports_function_tools": _model_supports_tools(provider_id, item),
     }
+
+
+def merge_context_window_from_reference(
+    models: list[dict[str, Any]], reference_models: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Fill missing context metadata using an unambiguous OpenRouter match."""
+    by_short_name: dict[str, list[dict[str, Any]]] = {}
+    for reference in reference_models:
+        if reference.get("context_window_source") == "fallback":
+            continue
+        short_name = reference["id"].rsplit("/", 1)[-1].casefold()
+        by_short_name.setdefault(short_name, []).append(reference)
+
+    enriched = []
+    for model in models:
+        source = model.get("context_window_source")
+        eligible = source in ("missing", "reference") or source is None
+        if eligible:
+            short_name = model["id"].rsplit("/", 1)[-1].casefold()
+            matches = by_short_name.get(short_name, [])
+            if len(matches) != 1:
+                canonical = [
+                    reference
+                    for reference in matches
+                    if ":" not in reference["id"].rsplit("/", 1)[-1]
+                ]
+                if len(canonical) == 1:
+                    matches = canonical
+            if len(matches) == 1:
+                model = dict(model)
+                model["context_window"] = matches[0]["context_window"]
+                model["context_window_source"] = "openrouter"
+        enriched.append(model)
+    return enriched
 
 
 def merge_reasoning_from_reference(

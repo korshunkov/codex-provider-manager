@@ -16,6 +16,7 @@ from provider_models import (  # noqa: E402
     find_model,
     merge_a6_marketplace_prices,
     merge_artificial_analysis_from_reference,
+    merge_context_window_from_reference,
     merge_reasoning_from_reference,
     normalize_model,
     _with_model_fields,
@@ -28,6 +29,7 @@ def model(model_id: str) -> dict:
         "display_name": model_id,
         "description": model_id,
         "context_window": 128000,
+        "context_window_source": "reference",
         "input_modalities": ["text"],
         "reasoning_levels": ["medium"],
         "default_reasoning_level": "medium",
@@ -161,6 +163,33 @@ class ProviderModelsTests(unittest.TestCase):
         self.assertEqual(normalized["default_reasoning_level"], "medium")
         self.assertFalse(normalized["supports_search_tool"])
         self.assertTrue(normalized["supports_function_tools"])
+
+    def test_a6_context_is_filled_from_unique_openrouter_reference(self) -> None:
+        a6_model = normalize_model("a6api", {"id": "kimi-k3"})
+        reference = model("moonshotai/kimi-k3")
+        reference["context_window"] = 1048576
+        reference["context_window_source"] = "provider"
+        enriched = merge_context_window_from_reference([a6_model], [reference])
+        self.assertEqual(enriched[0]["context_window"], 1048576)
+        self.assertEqual(enriched[0]["context_window_source"], "openrouter")
+
+    def test_anymodel_context_is_filled_from_unique_openrouter_reference(self) -> None:
+        anymodel = normalize_model("anymodel", {"id": "am/kimi-k3"})
+        reference = model("moonshotai/kimi-k3")
+        reference["context_window"] = 1048576
+        reference["context_window_source"] = "provider"
+        enriched = merge_context_window_from_reference([anymodel], [reference])
+        self.assertEqual(enriched[0]["context_window"], 1048576)
+        self.assertEqual(enriched[0]["context_window_source"], "openrouter")
+
+    def test_provider_context_is_not_replaced_by_openrouter(self) -> None:
+        a6_model = normalize_model("a6api", {"id": "kimi-k3", "context_length": 131072})
+        reference = model("moonshotai/kimi-k3")
+        reference["context_window"] = 1048576
+        reference["context_window_source"] = "provider"
+        enriched = merge_context_window_from_reference([a6_model], [reference])
+        self.assertEqual(enriched[0]["context_window"], 131072)
+        self.assertEqual(enriched[0]["context_window_source"], "provider")
 
     def test_explicit_provider_reasoning_levels_are_not_replaced(self) -> None:
         normalized = normalize_model("anymodel", {
