@@ -119,7 +119,7 @@ def _model_supports_search(item: dict[str, Any]) -> bool | None:
     return None
 
 
-def _reasoning_details(provider_id: str, item: dict[str, Any]) -> tuple[list[str], str]:
+def _reasoning_details(provider_id: str, item: dict[str, Any]) -> tuple[list[str], str, str]:
     reasoning = item.get("reasoning")
     if isinstance(reasoning, dict):
         efforts = reasoning.get("supported_efforts")
@@ -127,22 +127,22 @@ def _reasoning_details(provider_id: str, item: dict[str, Any]) -> tuple[list[str
             levels = [str(level) for level in efforts if str(level) in KNOWN_REASONING_LEVELS]
             if levels:
                 default = str(reasoning.get("default_effort", levels[0]))
-                return levels, default if default in levels else levels[0]
+                return levels, default if default in levels else levels[0], "provider"
 
     capabilities = item.get("capabilities")
     if provider_id in ("a6api", "anymodel"):
         # A6 and AnyModel expose only a reasoning boolean. Their real effort
         # list is filled later from an unambiguous OpenRouter match.
-        return ["medium"], "medium"
+        return ["medium"], "medium", "reference"
 
     if isinstance(capabilities, dict) and capabilities.get("reasoning"):
-        return ["low", "medium", "high"], "medium"
+        return ["low", "medium", "high"], "medium", "inferred"
 
     parameters = item.get("supported_parameters")
     if isinstance(parameters, list) and ("reasoning" in parameters or "reasoning_effort" in parameters):
-        return ["low", "medium", "high"], "medium"
+        return ["low", "medium", "high"], "medium", "inferred"
 
-    return ["medium"], "medium"
+    return ["medium"], "medium", "fallback"
 
 
 def _input_modalities(item: dict[str, Any]) -> list[str]:
@@ -294,11 +294,17 @@ def _with_model_fields(model: dict[str, Any], provider_id: str = "") -> dict[str
     model.setdefault("price_is_estimate", False)
     model.setdefault("supports_search_tool", None)
     model.setdefault("supports_function_tools", True)
-    if provider_id in ("a6api", "anymodel") and model.get("reasoning_levels") == ["low", "medium", "high"]:
-        # Migrate caches created before these providers got OpenRouter
-        # reasoning fallback support.
-        model["reasoning_levels"] = ["medium"]
-        model["default_reasoning_level"] = "medium"
+    if provider_id in ("a6api", "anymodel") and "reasoning_levels_source" not in model:
+        # Migrate caches created before the source marker was introduced.
+        if model.get("reasoning_levels") == ["low", "medium", "high"]:
+            model["reasoning_levels"] = ["medium"]
+            model["default_reasoning_level"] = "medium"
+            model["reasoning_levels_source"] = "reference"
+        elif model.get("reasoning_levels") == ["medium"]:
+            model["reasoning_levels_source"] = "reference"
+        else:
+            model["reasoning_levels_source"] = "provider"
+    model.setdefault("reasoning_levels_source", "fallback")
     return model
 
 
@@ -323,7 +329,7 @@ def normalize_model(provider_id: str, item: dict[str, Any]) -> dict[str, Any] | 
         return None
     if not _model_supports_tools(provider_id, item):
         return None
-    levels, default_level = _reasoning_details(provider_id, item)
+    levels, default_level, levels_source = _reasoning_details(provider_id, item)
     capabilities = item.get("capabilities") if isinstance(item.get("capabilities"), dict) else {}
     top_provider = item.get("top_provider") if isinstance(item.get("top_provider"), dict) else {}
     context_window = (
@@ -348,6 +354,7 @@ def normalize_model(provider_id: str, item: dict[str, Any]) -> dict[str, Any] | 
         "input_modalities": _input_modalities(item),
         "reasoning_levels": levels,
         "default_reasoning_level": default_level,
+        "reasoning_levels_source": levels_source,
         "input_price_per_million": input_price,
         "output_price_per_million": output_price,
         "intelligence_index": intelligence_index,
@@ -370,7 +377,9 @@ def merge_reasoning_from_reference(
 
     enriched = []
     for model in models:
-        if len(model["reasoning_levels"]) == 1 and model["reasoning_levels"] == ["medium"]:
+        source = model.get("reasoning_levels_source")
+        eligible = source == "reference" or (source is None and len(model["reasoning_levels"]) == 1 and model["reasoning_levels"] == ["medium"])
+        if eligible:
             short_name = model["id"].rsplit("/", 1)[-1].casefold()
             matches = by_short_name.get(short_name, [])
             if len(matches) != 1:
@@ -387,6 +396,7 @@ def merge_reasoning_from_reference(
                 model = dict(model)
                 model["reasoning_levels"] = list(matches[0]["reasoning_levels"])
                 model["default_reasoning_level"] = matches[0]["default_reasoning_level"]
+                model["reasoning_levels_source"] = "openrouter"
         enriched.append(model)
     return enriched
 

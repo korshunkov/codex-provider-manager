@@ -359,6 +359,7 @@ def available_models(provider_id: str, *, force: bool = False) -> list[dict]:
                 "input_modalities": ["text", "image"],
                 "reasoning_levels": [provider["reasoning"]],
                 "default_reasoning_level": provider["reasoning"],
+                "reasoning_levels_source": "fallback",
                 "input_price_per_million": None,
                 "output_price_per_million": None,
                 "intelligence_index": None,

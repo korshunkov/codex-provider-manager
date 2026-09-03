@@ -18,6 +18,7 @@ from provider_models import (  # noqa: E402
     merge_artificial_analysis_from_reference,
     merge_reasoning_from_reference,
     normalize_model,
+    _with_model_fields,
 )
 
 
@@ -30,6 +31,7 @@ def model(model_id: str) -> dict:
         "input_modalities": ["text"],
         "reasoning_levels": ["medium"],
         "default_reasoning_level": "medium",
+        "reasoning_levels_source": "reference",
         "input_price_per_million": None,
         "output_price_per_million": None,
         "intelligence_index": None,
@@ -160,6 +162,21 @@ class ProviderModelsTests(unittest.TestCase):
         self.assertFalse(normalized["supports_search_tool"])
         self.assertTrue(normalized["supports_function_tools"])
 
+    def test_explicit_provider_reasoning_levels_are_not_replaced(self) -> None:
+        normalized = normalize_model("anymodel", {
+            "id": "am/kimi-k3",
+            "reasoning": {
+                "supported_efforts": ["low", "medium"],
+                "default_effort": "low",
+            },
+        })
+        reference = model("moonshotai/kimi-k3")
+        reference["reasoning_levels"] = ["max", "high", "low"]
+        reference["default_reasoning_level"] = "max"
+        enriched = merge_reasoning_from_reference([normalized], [reference])
+        self.assertEqual(enriched[0]["reasoning_levels"], ["low", "medium"])
+        self.assertEqual(enriched[0]["default_reasoning_level"], "low")
+
     def test_search_support_can_be_read_from_openrouter_parameters(self) -> None:
         normalized = normalize_model("openrouter-all", {
             "id": "vendor/search-model",
@@ -186,6 +203,18 @@ class ProviderModelsTests(unittest.TestCase):
         enriched = merge_reasoning_from_reference([anymodel], [reference, batch_reference])
         self.assertEqual(enriched[0]["reasoning_levels"], ["max", "high", "low"])
         self.assertEqual(enriched[0]["default_reasoning_level"], "max")
+
+    def test_legacy_inferred_levels_are_migrated_for_reference_fallback(self) -> None:
+        legacy = model("am/kimi-k3")
+        legacy.pop("reasoning_levels_source")
+        legacy["reasoning_levels"] = ["low", "medium", "high"]
+        migrated = _with_model_fields(legacy, "anymodel")
+        self.assertEqual(migrated["reasoning_levels"], ["medium"])
+        self.assertEqual(migrated["reasoning_levels_source"], "reference")
+
+        legacy["reasoning_levels"] = ["medium"]
+        migrated = _with_model_fields(legacy, "anymodel")
+        self.assertEqual(migrated["reasoning_levels_source"], "reference")
 
     @patch("provider_models._bundled_catalog")
     def test_catalog_uses_provider_capabilities(self, bundled_catalog) -> None:
