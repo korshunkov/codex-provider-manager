@@ -10,15 +10,19 @@ import os
 from pathlib import Path
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
+import time
 import tomllib
 import urllib.error
 import urllib.request
 
 from provider_models import (
+    build_proxy_shelf,
     build_shelf,
+    compaction_selection,
     fetch_models,
     find_model,
     load_state,
@@ -27,10 +31,15 @@ from provider_models import (
     merge_artificial_analysis_from_reference,
     merge_context_window_from_reference,
     merge_reasoning_from_reference,
+    proxy_model_id,
+    proxy_selections,
     remember_model,
     save_state,
     search_models,
+    set_compaction_model,
     set_favorite,
+    set_selected_model,
+    selection_key,
     write_codex_catalog,
 )
 
@@ -44,6 +53,11 @@ BACKUPS_PATH = CODEX_HOME / "backups"
 MODEL_STATE_PATH = CODEX_HOME / "provider-model-state.json"
 MODEL_CACHE_PATH = CODEX_HOME / "provider-model-cache.json"
 MODEL_CATALOG_PATH = CODEX_HOME / "provider-model-catalog.json"
+PROXY_SCRIPT_PATH = CODEX_HOME / "bin" / "codex-provider-proxy"
+PROXY_PID_PATH = CODEX_HOME / "provider-proxy.pid"
+PROXY_LOG_PATH = CODEX_HOME / "provider-proxy.log"
+PROXY_BASE_URL = "http://127.0.0.1:8765/v1"
+PROXY_TARGET_ID = "__proxy__"
 CODEX_BINARY = Path(os.environ.get("CODEX_CLI_PATH", "/Applications/ChatGPT.app/Contents/Resources/codex"))
 DISPLAY_NAME = "OpenAI"
 # Codex writes this identifier into every session. It must remain stable so
@@ -127,6 +141,16 @@ def remove_managed_provider_blocks(text: str) -> str:
 
 
 def provider_block(target_id: str) -> str:
+    if target_id == PROXY_TARGET_ID:
+        return "\n".join(
+            [
+                f"[model_providers.{SESSION_PROVIDER_ID}]",
+                f"name = {toml_string(DISPLAY_NAME)}",
+                f"base_url = {toml_string(PROXY_BASE_URL)}",
+                'wire_api = "responses"',
+                "supports_websockets = false",
+            ]
+        )
     provider = PROVIDERS[target_id]
     lines = [
         f"[model_providers.{SESSION_PROVIDER_ID}]",
@@ -169,6 +193,8 @@ def active_service(config: dict) -> str:
             if args and args[0] in PROVIDERS:
                 return args[0]
             base_url = stable_provider.get("base_url")
+            if base_url == PROXY_BASE_URL:
+                return PROXY_TARGET_ID
             for provider_id, provider in PROVIDERS.items():
                 if provider["base_url"] == base_url:
                     return provider_id
@@ -177,6 +203,12 @@ def active_service(config: dict) -> str:
     if configured_id in PROVIDERS:
         return configured_id
     return SESSION_PROVIDER_ID
+
+
+def configured_proxy_text(text: str) -> str:
+    base = remove_managed_provider_blocks(text)
+    base = update_top_level(base, {"model_provider": SESSION_PROVIDER_ID})
+    return base.rstrip() + "\n\n" + provider_block(PROXY_TARGET_ID) + "\n"
 
 
 def configured_text(text: str, target_id: str | None = None) -> str:
@@ -399,6 +431,324 @@ def choose_model_for_provider(
     return selected or models[0]
 
 
+def external_proxy_entry(entry: dict[str, str]) -> dict[str, str]:
+    return {
+        "provider_id": entry["provider_id"],
+        "model_id": entry["model_id"],
+        "proxy_id": proxy_model_id(entry["provider_id"], entry["model_id"]),
+    }
+
+
+def proxy_entries(state: dict) -> list[dict[str, str]]:
+    return [external_proxy_entry(item) for item in proxy_selections(state)]
+
+
+def find_current_proxy_entry(
+    state: dict, selections: list[dict[str, str]], current_model: str | None
+) -> dict[str, str] | None:
+    if not isinstance(current_model, str):
+        return None
+    return next(
+        (
+            item
+            for item in selections
+            if proxy_model_id(item["provider_id"], item["model_id"]) == current_model
+        ),
+        None,
+    )
+
+
+def load_models_for_proxy_entries(entries: list[dict[str, str]]) -> dict[str, list[dict]]:
+    models_by_provider: dict[str, list[dict]] = {}
+    required_providers = {
+        entry["provider_id"]
+        for entry in entries
+        if entry.get("provider_id") in PROVIDERS
+    }
+    for provider_id in sorted(required_providers):
+        models_by_provider[provider_id] = available_models(provider_id)
+    return models_by_provider
+
+
+def rebuild_proxy_catalog(
+    state: dict,
+    models_by_provider: dict[str, list[dict]],
+    active: dict[str, str] | None,
+) -> list[dict]:
+    if not CODEX_BINARY.exists():
+        raise SystemExit(f"Не найден исполняемый файл Codex: {CODEX_BINARY}")
+    shelf = build_proxy_shelf(
+        state,
+        models_by_provider,
+        active,
+        compaction_selection(state),
+    )
+    try:
+        write_codex_catalog(MODEL_CATALOG_PATH, shelf, CODEX_BINARY, "proxy")
+    except (RuntimeError, subprocess.SubprocessError, json.JSONDecodeError) as error:
+        raise SystemExit(f"Не удалось создать каталог моделей Codex: {error}") from error
+    return shelf
+
+
+def apply_proxy_configuration(
+    state: dict,
+    selections: list[dict[str, str]],
+    active: dict[str, str] | None = None,
+    compaction: dict[str, str] | None | object = ...,
+) -> tuple[list[dict], str]:
+    if not selections:
+        raise SystemExit("Выберите хотя бы одну модель для прокси.")
+
+    metadata_entries = list(selections)
+    if active:
+        metadata_entries.append(active)
+    if compaction is not ... and compaction is not None:
+        metadata_entries.append(compaction)
+    models_by_provider = load_models_for_proxy_entries(metadata_entries)
+    valid: list[dict[str, str]] = []
+    for entry in selections:
+        provider_id = entry.get("provider_id", "")
+        model_id = entry.get("model_id", "")
+        if provider_id not in PROVIDERS:
+            raise SystemExit(f"Неизвестный провайдер: {provider_id}")
+        model = find_model(models_by_provider[provider_id], model_id)
+        if model is None:
+            raise SystemExit(f"Модель {model_id} не найдена у провайдера {provider_id}.")
+        key = selection_key(provider_id, model["id"])
+        if not any(selection_key(item["provider_id"], item["model_id"]) == key for item in valid):
+            valid.append({"provider_id": provider_id, "model_id": model["id"]})
+
+    current_config = load_config()
+    if active is None:
+        active = find_current_proxy_entry(
+            state, valid, current_config.get("model")
+        ) or valid[0]
+    else:
+        active_model = find_model(models_by_provider[active["provider_id"]], active["model_id"])
+        if active_model is None:
+            raise SystemExit(
+                f"Модель {active['model_id']} не найдена у провайдера {active['provider_id']}."
+            )
+        active = {"provider_id": active["provider_id"], "model_id": active_model["id"]}
+
+    if compaction is not ...:
+        if compaction is None:
+            set_compaction_model(state, None, None)
+        else:
+            compaction_model = find_model(
+                models_by_provider[compaction["provider_id"]], compaction["model_id"]
+            )
+            if compaction_model is None:
+                raise SystemExit(
+                    f"Модель компакта {compaction['model_id']} недоступна у "
+                    f"провайдера {compaction['provider_id']}."
+                )
+            set_compaction_model(
+                state, compaction["provider_id"], compaction_model["id"]
+            )
+
+    state["selected_models"] = valid
+    shelf = rebuild_proxy_catalog(state, models_by_provider, active)
+    represented = {model["id"] for model in shelf}
+    warnings = [
+        f"{entry['model_id']} не попала в каталог Codex: достигнут лимит {len(shelf)}."
+        for entry in valid
+        if proxy_model_id(entry["provider_id"], entry["model_id"]) not in represented
+    ]
+
+    active_proxy_id = proxy_model_id(active["provider_id"], active["model_id"])
+    active_model = find_model(models_by_provider[active["provider_id"]], active["model_id"])
+    assert active_model is not None
+    current = CONFIG_PATH.read_text(encoding="utf-8")
+    current_effort = current_config.get("model_reasoning_effort")
+    if current_effort not in active_model["reasoning_levels"]:
+        current_effort = active_model["default_reasoning_level"]
+    values = {
+        "model_provider": SESSION_PROVIDER_ID,
+        "model": active_proxy_id,
+        "model_reasoning_effort": current_effort,
+        "model_catalog_json": str(MODEL_CATALOG_PATH),
+    }
+    updated = update_top_level(configured_proxy_text(current), values)
+    if updated != current:
+        write_config(updated, backup=True)
+    save_state(MODEL_STATE_PATH, state)
+    start_proxy()
+    return warnings, active_proxy_id
+
+
+def proxy_process_pid() -> int | None:
+    try:
+        return int(PROXY_PID_PATH.read_text(encoding="ascii").strip())
+    except (FileNotFoundError, ValueError, OSError):
+        return None
+
+
+def proxy_is_running() -> bool:
+    pid = proxy_process_pid()
+    if pid is None:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except (ProcessLookupError, PermissionError):
+        return False
+
+
+def start_proxy() -> bool:
+    if proxy_is_running():
+        return False
+    script = PROXY_SCRIPT_PATH
+    if not script.exists():
+        script = Path(__file__).with_name("codex-provider-proxy")
+    if not script.exists():
+        raise SystemExit(f"Не найден скрипт прокси: {script}")
+
+    PROXY_LOG_PATH.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    with PROXY_LOG_PATH.open("ab") as log:
+        process = subprocess.Popen(
+            [sys.executable, str(script), "--port", "8765"],
+            stdin=subprocess.DEVNULL,
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+    PROXY_PID_PATH.write_text(f"{process.pid}\n", encoding="ascii")
+    for _ in range(30):
+        try:
+            with urllib.request.urlopen("http://127.0.0.1:8765/status", timeout=0.2) as response:
+                if response.status == 200:
+                    return True
+        except (urllib.error.URLError, TimeoutError, OSError):
+            time.sleep(0.1)
+    raise SystemExit("Прокси не ответил после запуска. Подробности: provider-proxy.log")
+
+
+def stop_proxy() -> bool:
+    pid = proxy_process_pid()
+    if not proxy_is_running():
+        PROXY_PID_PATH.unlink(missing_ok=True)
+        return False
+    assert pid is not None
+    os.kill(pid, signal.SIGTERM)
+    for _ in range(30):
+        if not proxy_is_running():
+            break
+        time.sleep(0.1)
+    if proxy_is_running():
+        os.kill(pid, signal.SIGKILL)
+    PROXY_PID_PATH.unlink(missing_ok=True)
+    return True
+
+
+def command_proxy_configure(_: argparse.Namespace) -> None:
+    try:
+        payload = json.load(sys.stdin)
+    except json.JSONDecodeError as error:
+        raise SystemExit(f"Не удалось прочитать JSON выбора: {error}")
+    if not isinstance(payload, dict) or not isinstance(payload.get("models"), list):
+        raise SystemExit("Ожидался JSON с массивом models.")
+
+    state = load_state(MODEL_STATE_PATH)
+    selections = []
+    for item in payload["models"]:
+        if not isinstance(item, dict):
+            continue
+        provider_id = str(item.get("provider_id", ""))
+        model_id = str(item.get("model_id", ""))
+        if provider_id and model_id:
+            selections.append({"provider_id": provider_id, "model_id": model_id})
+
+    compaction = ...
+    if "compaction_model" in payload:
+        value = payload["compaction_model"]
+        compaction = (
+            {
+                "provider_id": str(value.get("provider_id", "")),
+                "model_id": str(value.get("model_id", "")),
+            }
+            if isinstance(value, dict)
+            else None
+        )
+    active = payload.get("active_model")
+    active = (
+        {
+            "provider_id": str(active.get("provider_id", "")),
+            "model_id": str(active.get("model_id", "")),
+        }
+        if isinstance(active, dict)
+        else None
+    )
+    warnings, proxy_id = apply_proxy_configuration(
+        state, selections, active=active, compaction=compaction
+    )
+    print(
+        json.dumps(
+            {
+                "ok": True,
+                "active_model": proxy_id,
+                "selected": proxy_entries(state),
+                "warnings": warnings,
+            },
+            ensure_ascii=False,
+        )
+    )
+
+
+def command_proxy_select(args: argparse.Namespace) -> None:
+    models = available_models(args.provider, force=args.refresh)
+    model = find_model(models, args.model)
+    if model is None:
+        raise SystemExit(f"Модель {args.model} не найдена у провайдера {args.provider}.")
+    state = load_state(MODEL_STATE_PATH)
+    set_selected_model(state, args.provider, model["id"], True)
+    current_selections = proxy_selections(state)
+    warnings, proxy_id = apply_proxy_configuration(
+        state,
+        current_selections,
+        active={"provider_id": args.provider, "model_id": model["id"]},
+    )
+    print(
+        json.dumps(
+            {
+                "ok": True,
+                "active_model": proxy_id,
+                "selected": proxy_entries(state),
+                "warnings": warnings,
+            },
+            ensure_ascii=False,
+        )
+    )
+
+
+def command_proxy_status(_: argparse.Namespace) -> None:
+    state = load_state(MODEL_STATE_PATH)
+    compaction = compaction_selection(state)
+    print(
+        json.dumps(
+            {
+                "running": proxy_is_running(),
+                "pid": proxy_process_pid(),
+                "base_url": PROXY_BASE_URL,
+                "configured": active_service(load_config()) == PROXY_TARGET_ID,
+                "selected": proxy_entries(state),
+                "compaction_model": external_proxy_entry(compaction) if compaction else None,
+            },
+            ensure_ascii=False,
+        )
+    )
+
+
+def command_proxy_start(_: argparse.Namespace) -> None:
+    started = start_proxy()
+    print("Прокси запущен." if started else "Прокси уже работает.")
+
+
+def command_proxy_stop(_: argparse.Namespace) -> None:
+    stopped = stop_proxy()
+    print("Прокси остановлен." if stopped else "Прокси не был запущен.")
+
+
 def prepare_model_catalog(
     provider_id: str,
     selected_model: dict,
@@ -432,6 +782,12 @@ def command_list(_: argparse.Namespace) -> None:
 def command_current(_: argparse.Namespace) -> None:
     config = load_config()
     provider_id = active_service(config)
+    if provider_id == PROXY_TARGET_ID:
+        print("Текущий сервис: локальный прокси моделей")
+        print(f"Адрес: {PROXY_BASE_URL}")
+        print(f"Модель: {config.get('model', 'не задана')}")
+        print(f"Идентификатор новых сессий: {SESSION_PROVIDER_ID}")
+        return
     print(f"Текущий сервис: {provider_id}")
     print(f"Модель: {config.get('model', 'не задана')}")
     print(f"Идентификатор новых сессий: {SESSION_PROVIDER_ID}")
@@ -439,6 +795,10 @@ def command_current(_: argparse.Namespace) -> None:
 
 def command_install(_: argparse.Namespace) -> None:
     active = active_service(load_config())
+    if active == PROXY_TARGET_ID:
+        start_proxy()
+        print("Работает локальный прокси моделей; настройки провайдеров не тронуты.")
+        return
     api_key = load_credentials().get(SESSION_PROVIDER_ID) if active == SESSION_PROVIDER_ID else None
     if active == SESSION_PROVIDER_ID and not api_key:
         raise SystemExit("Не найден ключ Codex Sale.")
@@ -455,6 +815,10 @@ def command_install(_: argparse.Namespace) -> None:
 
 
 def command_use(args: argparse.Namespace) -> None:
+    if active_service(tomllib.loads(CONFIG_PATH.read_text(encoding="utf-8"))) == PROXY_TARGET_ID:
+        raise SystemExit(
+            "Включён локальный прокси. Используйте: codex-provider proxy select <провайдер> --model <модель>"
+        )
     api_key = load_credentials().get(SESSION_PROVIDER_ID) if args.provider == SESSION_PROVIDER_ID else None
     if args.provider == SESSION_PROVIDER_ID and not api_key:
         raise SystemExit("Не найден ключ Codex Sale.")
@@ -716,6 +1080,23 @@ def build_parser() -> argparse.ArgumentParser:
     favorite.add_argument("--provider", choices=PROVIDERS.keys())
     favorite.add_argument("--remove", action="store_true", help="убрать из избранного")
     favorite.set_defaults(handler=command_favorite)
+
+    proxy = subcommands.add_parser("proxy", help="управление локальным прокси моделей")
+    proxy_subcommands = proxy.add_subparsers(dest="proxy_action", required=True)
+    proxy_status = proxy_subcommands.add_parser("status", help="показать состояние прокси")
+    proxy_status.set_defaults(handler=command_proxy_status)
+    proxy_configure = proxy_subcommands.add_parser("configure", help="применить JSON со списком моделей")
+    proxy_configure.add_argument("--stdin", action="store_true")
+    proxy_configure.set_defaults(handler=command_proxy_configure)
+    proxy_select = proxy_subcommands.add_parser("select", help="сделать модель активной")
+    proxy_select.add_argument("provider", choices=PROVIDERS.keys())
+    proxy_select.add_argument("--model", required=True)
+    proxy_select.add_argument("--refresh", action="store_true")
+    proxy_select.set_defaults(handler=command_proxy_select)
+    proxy_start = proxy_subcommands.add_parser("start", help="запустить прокси")
+    proxy_start.set_defaults(handler=command_proxy_start)
+    proxy_stop = proxy_subcommands.add_parser("stop", help="остановить прокси")
+    proxy_stop.set_defaults(handler=command_proxy_stop)
 
     set_key = subcommands.add_parser("set-key", help="безопасно заменить ключ провайдера")
     set_key.add_argument("provider", choices=PROVIDERS.keys())

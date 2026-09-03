@@ -15,6 +15,7 @@ import urllib.request
 
 
 SHELF_LIMIT = 30
+PROXY_SHELF_LIMIT = 30
 CACHE_MAX_AGE_SECONDS = 6 * 60 * 60
 KNOWN_REASONING_LEVELS = ("minimal", "low", "medium", "high", "xhigh", "max", "ultra")
 REASONING_DESCRIPTIONS = {
@@ -25,6 +26,14 @@ REASONING_DESCRIPTIONS = {
     "xhigh": "Очень глубокие рассуждения",
     "max": "Максимальная глубина рассуждений",
     "ultra": "Максимальные рассуждения с автоматическим делегированием",
+}
+PROXY_PROVIDER_ALIASES = {
+    "codex-sale": "cx",
+    "vibecode": "vc",
+    "anymodel": "am",
+    "a6api": "a6",
+    "openrouter-all": "or",
+    "openrouter": "orf",
 }
 ANYMODEL_BASE_PRICE_PER_MILLION = 0.05
 A6_MARKETPLACE_PRICES_URL = "https://a6api.com/api/marketplace/public/channels/search?offset=0&limit=10000"
@@ -60,6 +69,8 @@ def load_state(path: Path) -> dict[str, Any]:
     state.setdefault("favorites", {})
     state.setdefault("recent", {})
     state.setdefault("last_model", {})
+    state.setdefault("selected_models", [])
+    state.setdefault("compaction_model", None)
     return state
 
 
@@ -81,6 +92,109 @@ def set_favorite(state: dict[str, Any], provider_id: str, model_id: str, enabled
     if enabled:
         favorites.insert(0, model_id)
     state["favorites"][provider_id] = favorites
+
+
+def selection_key(provider_id: str, model_id: str) -> str:
+    return f"{provider_id}|{model_id}"
+
+
+def proxy_model_id(provider_id: str, model_id: str) -> str:
+    """Return the stable model name Codex sees through the local proxy."""
+    if provider_id == "anymodel" and model_id.startswith("am/"):
+        return model_id
+    alias = PROXY_PROVIDER_ALIASES.get(provider_id)
+    return f"{alias}/{model_id}" if alias else model_id
+
+
+def set_selected_model(
+    state: dict[str, Any], provider_id: str, model_id: str, enabled: bool
+) -> None:
+    key = selection_key(provider_id, model_id)
+    selected = [
+        item
+        for item in state.get("selected_models", [])
+        if not isinstance(item, dict)
+        or selection_key(str(item.get("provider_id", "")), str(item.get("model_id", ""))) != key
+    ]
+    if enabled:
+        selected.insert(0, {"provider_id": provider_id, "model_id": model_id})
+    state["selected_models"] = selected
+
+
+def set_compaction_model(
+    state: dict[str, Any], provider_id: str | None, model_id: str | None
+) -> None:
+    if provider_id is None or model_id is None:
+        state["compaction_model"] = None
+        return
+    state["compaction_model"] = {"provider_id": provider_id, "model_id": model_id}
+
+
+def proxy_selections(state: dict[str, Any]) -> list[dict[str, str]]:
+    result: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for item in state.get("selected_models", []):
+        if not isinstance(item, dict):
+            continue
+        provider_id = str(item.get("provider_id", ""))
+        model_id = str(item.get("model_id", ""))
+        key = selection_key(provider_id, model_id)
+        if provider_id and model_id and key not in seen:
+            seen.add(key)
+            result.append({"provider_id": provider_id, "model_id": model_id})
+    return result
+
+
+def compaction_selection(state: dict[str, Any]) -> dict[str, str] | None:
+    item = state.get("compaction_model")
+    if not isinstance(item, dict):
+        return None
+    provider_id = str(item.get("provider_id", ""))
+    model_id = str(item.get("model_id", ""))
+    return (
+        {"provider_id": provider_id, "model_id": model_id}
+        if provider_id and model_id
+        else None
+    )
+
+
+def build_proxy_shelf(
+    state: dict[str, Any],
+    models_by_provider: dict[str, list[dict[str, Any]]],
+    active: dict[str, str] | None = None,
+    compaction: dict[str, str] | None = None,
+) -> list[dict[str, Any]]:
+    """Build a Codex catalog from explicit selections, in selection order."""
+    selected = proxy_selections(state)
+    for item in (active, compaction):
+        if not item:
+            continue
+        key = selection_key(item["provider_id"], item["model_id"])
+        if not any(
+            selection_key(existing["provider_id"], existing["model_id"]) == key
+            for existing in selected
+        ):
+            selected.append(item)
+
+    shelf: list[dict[str, Any]] = []
+    for item in selected:
+        provider_id = item["provider_id"]
+        model_id = item["model_id"]
+        model = next(
+            (
+                candidate
+                for candidate in models_by_provider.get(provider_id, [])
+                if candidate["id"] == model_id
+            ),
+            None,
+        )
+        if model is None:
+            continue
+        external_model = dict(model)
+        external_model["id"] = proxy_model_id(provider_id, model_id)
+        if not any(existing["id"] == external_model["id"] for existing in shelf):
+            shelf.append(external_model)
+    return shelf[:PROXY_SHELF_LIMIT]
 
 
 def _is_free_openrouter_model(item: dict[str, Any]) -> bool:

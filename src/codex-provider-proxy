@@ -1,0 +1,358 @@
+#!/opt/homebrew/bin/python3
+"""Local Responses API router for models from several Codex providers."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+import os
+import signal
+import sys
+import time
+import urllib.error
+import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from socketserver import ThreadingMixIn
+from typing import Any
+
+CODEX_HOME = Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex"))).expanduser()
+STATE_PATH = CODEX_HOME / "provider-model-state.json"
+CREDENTIALS_PATH = CODEX_HOME / "provider-credentials.json"
+LOG_PATH = CODEX_HOME / "provider-proxy.log"
+DEFAULT_PORT = 8765
+READ_TIMEOUT = 600
+CONNECT_TIMEOUT = 10
+
+PROVIDERS = {
+    "codex-sale": {
+        "base_url": "https://codex.sale/backend-api/codex",
+        "credential_id": "codex-sale",
+    },
+    "vibecode": {"base_url": "https://vibecode.moe/v1", "credential_id": "vibecode"},
+    "anymodel": {"base_url": "https://anymodel.org/v1", "credential_id": "anymodel"},
+    "a6api": {"base_url": "https://api.a6api.com/v1", "credential_id": "a6api"},
+    "openrouter": {"base_url": "https://openrouter.ai/api/v1", "credential_id": "openrouter"},
+    "openrouter-all": {"base_url": "https://openrouter.ai/api/v1", "credential_id": "openrouter"},
+}
+
+ALIASES = {
+    "codex-sale": "cx",
+    "vibecode": "vc",
+    "anymodel": "am",
+    "a6api": "a6",
+    "openrouter-all": "or",
+    "openrouter": "orf",
+}
+
+
+def proxy_model_id(provider_id: str, model_id: str) -> str:
+    if provider_id == "anymodel" and model_id.startswith("am/"):
+        return model_id
+    alias = ALIASES.get(provider_id)
+    return f"{alias}/{model_id}" if alias else model_id
+
+
+def load_state() -> dict[str, Any]:
+    try:
+        state = json.loads(STATE_PATH.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return {}
+    return state if isinstance(state, dict) else {}
+
+
+def selected_models(state: dict[str, Any]) -> list[dict[str, str]]:
+    result: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for item in state.get("selected_models", []):
+        if not isinstance(item, dict):
+            continue
+        provider_id = str(item.get("provider_id", ""))
+        model_id = str(item.get("model_id", ""))
+        key = f"{provider_id}|{model_id}"
+        if provider_id in PROVIDERS and model_id and key not in seen:
+            seen.add(key)
+            result.append({"provider_id": provider_id, "model_id": model_id})
+    return result
+
+
+def compaction_model(state: dict[str, Any]) -> dict[str, str] | None:
+    item = state.get("compaction_model")
+    if not isinstance(item, dict):
+        return None
+    provider_id = str(item.get("provider_id", ""))
+    model_id = str(item.get("model_id", ""))
+    if provider_id in PROVIDERS and model_id:
+        return {"provider_id": provider_id, "model_id": model_id}
+    return None
+
+
+def model_route(state: dict[str, Any], external_id: str) -> dict[str, str] | None:
+    candidates = selected_models(state)
+    compaction = compaction_model(state)
+    if compaction:
+        candidates.append(compaction)
+    for item in candidates:
+        if proxy_model_id(item["provider_id"], item["model_id"]) == external_id:
+            return item
+    return None
+
+
+def provider_key(provider_id: str) -> str | None:
+    try:
+        credentials = json.loads(CREDENTIALS_PATH.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return None
+    credential_id = PROVIDERS[provider_id]["credential_id"]
+    value = credentials.get(credential_id) if isinstance(credentials, dict) else None
+    return value.strip() if isinstance(value, str) and value.strip() else None
+
+
+def request_headers(provider_id: str, incoming: dict[str, str]) -> dict[str, str]:
+    api_key = provider_key(provider_id)
+    if not api_key:
+        raise RuntimeError(f"Ключ провайдера {provider_id} не настроен.")
+    headers = {
+        "Accept": incoming.get("accept", "application/json"),
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": incoming.get("content_type", "application/json"),
+        "User-Agent": "CodexProviderProxy/1.0",
+        "Accept-Encoding": "identity",
+    }
+    # Metadata headers are useful to providers which implement Codex semantics.
+    for name in ("session_id", "x-openai-subagent", "x-codex-turn-state"):
+        if incoming.get(name.lower()):
+            headers[name] = incoming[name.lower()]
+    return headers
+
+
+def response_text(payload: dict[str, Any]) -> str:
+    """Extract compaction material from a normal Responses API result."""
+    chunks: list[str] = []
+    output = payload.get("output", [])
+    if isinstance(output, list):
+        for item in output:
+            if not isinstance(item, dict):
+                continue
+            if item.get("type") == "compaction" and item.get("encrypted_content"):
+                chunks.append(str(item["encrypted_content"]))
+            content = item.get("content", [])
+            if isinstance(content, list):
+                for part in content:
+                    if isinstance(part, dict) and part.get("text"):
+                        chunks.append(str(part["text"]))
+    # Some OpenAI-compatible gateways answer a non-streaming Responses call
+    # with a Chat Completions body. Reuse its text for compaction.
+    choices = payload.get("choices", [])
+    if isinstance(choices, list) and choices:
+        message = choices[0].get("message", {}) if isinstance(choices[0], dict) else {}
+        if message.get("content"):
+            chunks.append(str(message["content"]))
+        for call in message.get("tool_calls", []) or []:
+            if isinstance(call, dict) and call.get("function", {}).get("arguments"):
+                chunks.append(str(call["function"]["arguments"]))
+    if not chunks and isinstance(payload.get("output_text"), str):
+        chunks.append(payload["output_text"])
+    return "\n".join(chunk for chunk in chunks if chunk)
+
+
+class ProxyHandler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    server_version = "CodexProviderProxy/1.0"
+
+    def log_message(self, format: str, *args: Any) -> None:
+        # Access logs do not contain request or response content.
+        logging.info("%s %s", self.command, self.path.split("?", 1)[0])
+
+    def do_GET(self) -> None:
+        if self.path.split("?", 1)[0] in ("/status", "/health"):
+            self.send_json({"ok": True, "providers": sorted(set(ALIASES))})
+        else:
+            self.send_json({"error": "Not found"}, status=404)
+
+    def do_POST(self) -> None:
+        path = self.path.split("?", 1)[0]
+        if path not in ("/responses", "/v1/responses", "/responses/compact", "/v1/responses/compact"):
+            self.send_json({"error": f"Endpoint {path} не поддерживается."}, status=404)
+            return
+
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+            raw = self.rfile.read(length) if length else b"{}"
+            data = json.loads(raw.decode("utf-8"))
+            if not isinstance(data, dict):
+                raise ValueError("Тело запроса должно быть JSON-объектом.")
+        except (ValueError, json.JSONDecodeError, UnicodeDecodeError) as error:
+            self.send_json({"error": f"Некорректный запрос: {error}"}, status=400)
+            return
+
+        state = load_state()
+        try:
+            if path.endswith("/compact"):
+                self.handle_compact(data, state)
+            else:
+                self.handle_responses(data, state)
+        except (BrokenPipeError, ConnectionResetError):
+            logging.warning("Клиент отключился во время ответа.")
+        except (RuntimeError, urllib.error.URLError, TimeoutError, OSError) as error:
+            logging.error("Запрос не выполнен: %s", error)
+            self.send_json({"error": str(error)}, status=502)
+        except Exception as error:
+            logging.exception("Внутренняя ошибка прокси")
+            self.send_json({"error": f"Внутренняя ошибка: {error}"}, status=500)
+
+    def incoming_headers(self) -> dict[str, str]:
+        return {name.lower(): value for name, value in self.headers.items()}
+
+    def handle_responses(self, data: dict[str, Any], state: dict[str, Any]) -> None:
+        external_id = str(data.get("model", ""))
+        route = model_route(state, external_id)
+        if route is None:
+            self.send_json(
+                {"error": f"Модель {external_id or '(не задана)'} не включена в прокси."},
+                status=404,
+            )
+            return
+        data["model"] = route["model_id"]
+        upstream_url = f"{PROVIDERS[route['provider_id']]['base_url'].rstrip('/')}/responses"
+        self.forward(upstream_url, data, route["provider_id"])
+
+    def handle_compact(self, data: dict[str, Any], state: dict[str, Any]) -> None:
+        route = compaction_model(state)
+        if route is None:
+            self.send_json({"error": "Модель для компакта не выбрана."}, status=409)
+            return
+
+        payload = {
+            "model": route["model_id"],
+            "input": data.get("input", data.get("messages", "")),
+            "instructions": data.get(
+                "instructions", "Сожми историю разговора, сохранив важные факты и решения."
+            ),
+            "store": False,
+            "stream": False,
+            "max_output_tokens": 4096,
+        }
+        upstream_url = f"{PROVIDERS[route['provider_id']]['base_url'].rstrip('/')}/responses"
+        response = self.upstream_response(upstream_url, payload, route["provider_id"])
+        try:
+            body = response.read()
+            status = response.status
+        finally:
+            response.close()
+        if status != 200:
+            self.forward_error(status, body)
+            return
+        try:
+            result = json.loads(body.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            self.send_json({"error": f"Провайдер вернул не JSON: {error}"}, status=502)
+            return
+        text = response_text(result if isinstance(result, dict) else {})
+        if not text:
+            self.send_json({"error": "Провайдер не вернул текст для компакта."}, status=502)
+            return
+        self.send_json(
+            {
+                "id": f"resp_compact_{int(time.time() * 1000)}",
+                "object": "response",
+                "created_at": int(time.time()),
+                "model": proxy_model_id(route["provider_id"], route["model_id"]),
+                "status": "completed",
+                "output": [{"type": "compaction", "encrypted_content": text}],
+            }
+        )
+
+    def upstream_response(
+        self, url: str, payload: dict[str, Any], provider_id: str
+    ) -> urllib.request.urlopen:  # type: ignore[name-defined]
+        encoded = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        request = urllib.request.Request(
+            url,
+            data=encoded,
+            headers=request_headers(provider_id, self.incoming_headers()),
+            method="POST",
+        )
+        try:
+            return urllib.request.urlopen(request, timeout=READ_TIMEOUT)
+        except urllib.error.HTTPError as error:
+            # HTTPError carries the provider's useful error body and headers.
+            return error
+
+    def forward(self, url: str, payload: dict[str, Any], provider_id: str) -> None:
+        response = self.upstream_response(url, payload, provider_id)
+        self.send_response(response.status)
+        for name in ("Content-Type", "Content-Length", "Retry-After"):
+            value = response.headers.get(name)
+            if value:
+                self.send_header(name, value)
+        self.send_header("Cache-Control", "no-store")
+        is_stream = "text/event-stream" in (response.headers.get("Content-Type") or "")
+        if is_stream and not response.headers.get("Content-Length"):
+            self.send_header("Connection", "close")
+        self.end_headers()
+        try:
+            while True:
+                chunk = response.read(8192)
+                if not chunk:
+                    break
+                self.wfile.write(chunk)
+                self.wfile.flush()
+        finally:
+            response.close()
+            if is_stream:
+                self.close_connection = True
+
+    def forward_error(self, status: int, body: bytes) -> None:
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def send_json(self, payload: dict[str, Any], status: int = 200) -> None:
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+
+class Server(ThreadingHTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+
+def configure_logging() -> None:
+    CODEX_HOME.mkdir(mode=0o700, parents=True, exist_ok=True)
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(message)s",
+        handlers=[logging.FileHandler(LOG_PATH, encoding="utf-8")],
+    )
+
+
+def run(port: int) -> None:
+    configure_logging()
+    server = Server(("127.0.0.1", port), ProxyHandler)
+    logging.info("Proxy listening on 127.0.0.1:%s", port)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.server_close()
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Локальный маршрутизатор моделей Codex.")
+    parser.add_argument("--port", type=int, default=DEFAULT_PORT)
+    arguments = parser.parse_args()
+    run(arguments.port)
+
+
+if __name__ == "__main__":
+    main()

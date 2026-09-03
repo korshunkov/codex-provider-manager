@@ -106,6 +106,40 @@ struct ProviderOption: Hashable, Identifiable {
     let name: String
 }
 
+struct ProxySelection: Codable, Hashable {
+    let providerID: String
+    let modelID: String
+
+    enum CodingKeys: String, CodingKey {
+        case providerID = "provider_id"
+        case modelID = "model_id"
+    }
+
+    var key: String { "\(providerID)|\(modelID)" }
+}
+
+struct ProxyStateResponse: Decodable {
+    let running: Bool
+    let selected: [ProxySelection]
+    let compactionModel: ProxySelection?
+
+    enum CodingKeys: String, CodingKey {
+        case running
+        case selected
+        case compactionModel = "compaction_model"
+    }
+}
+
+struct ProxyApplyResponse: Decodable {
+    let activeModel: String
+    let warnings: [String]?
+
+    enum CodingKeys: String, CodingKey {
+        case activeModel = "active_model"
+        case warnings
+    }
+}
+
 enum PriceFilter: String, CaseIterable, Identifiable {
     case all
     case withPrice
@@ -131,6 +165,9 @@ final class ModelStore: ObservableObject {
     @Published var status = "Нажмите «Обновить», чтобы загрузить модели."
     @Published var isLoading = false
     @Published var currentModel = ""
+    @Published var selectedModels: [ProxySelection] = []
+    @Published var compactionModel: ProxySelection?
+    @Published var proxyRunning = false
 
     let providers = [
         ProviderOption(id: "all", name: "Все провайдеры"),
@@ -147,6 +184,28 @@ final class ModelStore: ObservableObject {
     ]
 
     private let cliURL = URL(fileURLWithPath: "/Users/admin/.local/bin/codex-provider")
+
+    func loadProxyState() {
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let result = Self.runProcess(self?.cliURL, arguments: ["proxy", "status"])
+            DispatchQueue.main.async {
+                guard let self else { return }
+                switch result {
+                case .success(let output):
+                    do {
+                        let state = try JSONDecoder().decode(ProxyStateResponse.self, from: output)
+                        self.proxyRunning = state.running
+                        self.selectedModels = state.selected
+                        self.compactionModel = state.compactionModel
+                    } catch {
+                        self.status = "Не удалось прочитать выбор прокси: \(error.localizedDescription)"
+                    }
+                case .failure(.message(let error)):
+                    self.status = "Прокси недоступен: \(error)"
+                }
+            }
+        }
+    }
 
     func load(refresh: Bool = false) {
         if providerID == "all" {
@@ -248,11 +307,98 @@ final class ModelStore: ObservableObject {
         rows.first { $0.id == selectedRowID }
     }
 
+    func selection(for row: ModelRow) -> ProxySelection {
+        ProxySelection(providerID: row.providerID ?? providerID, modelID: row.modelID)
+    }
+
+    func isSelected(_ row: ModelRow) -> Bool {
+        selectedModels.contains { $0.key == selection(for: row).key }
+    }
+
+    func setSelection(_ row: ModelRow, enabled: Bool) {
+        let item = selection(for: row)
+        selectedModels.removeAll { $0.key == item.key }
+        if enabled {
+            selectedModels.append(item)
+        }
+    }
+
+    func clearSelection() {
+        selectedModels.removeAll()
+        status = "Галочки сняты. Нажмите «Включить выбранные», чтобы сохранить изменения."
+    }
+
+    func selectionLabel(_ item: ProxySelection?) -> String {
+        guard let item else { return "Не выбрана" }
+        if let row = rows.first(where: { $0.providerID == item.providerID && $0.modelID == item.modelID }) {
+            return row.displayName
+        }
+        return item.modelID
+    }
+
+    func applySelection() {
+        guard !selectedModels.isEmpty else { return }
+        isLoading = true
+        status = "Включаю выбранные модели в конфиг…"
+        let active = selectedRow.flatMap { selection(for: $0) }
+        var payload: [String: Any] = [
+            "models": selectedModels.map { ["provider_id": $0.providerID, "model_id": $0.modelID] },
+        ]
+        if let compactionModel {
+            payload["compaction_model"] = [
+                "provider_id": compactionModel.providerID,
+                "model_id": compactionModel.modelID,
+            ]
+        } else {
+            payload["compaction_model"] = NSNull()
+        }
+        if let active {
+            payload["active_model"] = [
+                "provider_id": active.providerID,
+                "model_id": active.modelID,
+            ]
+        }
+        let data: Data
+        do {
+            data = try JSONSerialization.data(withJSONObject: payload)
+        } catch {
+            isLoading = false
+            status = "Не удалось создать запрос: \(error.localizedDescription)"
+            return
+        }
+        let arguments = ["proxy", "configure", "--stdin"]
+
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let result = Self.runProcess(self?.cliURL, arguments: arguments, stdin: data)
+            DispatchQueue.main.async {
+                guard let self else { return }
+                switch result {
+                case .success(let output):
+                    do {
+                        let decoded = try JSONDecoder().decode(ProxyApplyResponse.self, from: output)
+                        let warning = decoded.warnings?.isEmpty == false ? " \(decoded.warnings!.joined(separator: " "))" : ""
+                        self.status = "Выбор применён. Активная: \(decoded.activeModel).\(warning) Перезапускаю Codex…"
+                        self.loadProxyState()
+                        self.restartCodex()
+                    } catch {
+                        self.isLoading = false
+                        self.status = "Не удалось разобрать ответ прокси: \(error.localizedDescription)"
+                    }
+                case .failure(.message(let error)):
+                    self.isLoading = false
+                    self.status = error
+                }
+            }
+        }
+    }
+
     func selectCurrentRow() {
         guard let row = selectedRow else { return }
+        let rowSelection = selection(for: row)
+        setSelection(row, enabled: true)
         isLoading = true
-        status = "Выбираю модель…"
-        let arguments = ["use", row.providerID ?? providerID, "--model", row.modelID]
+        status = "Делаю модель активной…"
+        let arguments = ["proxy", "select", rowSelection.providerID, "--model", rowSelection.modelID]
 
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             let result = Self.runProcess(self?.cliURL, arguments: arguments)
@@ -261,6 +407,7 @@ final class ModelStore: ObservableObject {
                 switch result {
                 case .success:
                     self.status = "Модель выбрана. Перезапускаю Codex…"
+                    self.loadProxyState()
                     self.restartCodex()
                 case .failure(.message(let error)):
                     self.isLoading = false
@@ -312,7 +459,11 @@ final class ModelStore: ObservableObject {
         case message(String)
     }
 
-    nonisolated private static func runProcess(_ executableURL: URL?, arguments: [String]) -> Result<Data, ProcessError> {
+    nonisolated private static func runProcess(
+        _ executableURL: URL?,
+        arguments: [String],
+        stdin: Data? = nil
+    ) -> Result<Data, ProcessError> {
         guard let executableURL else { return .failure(.message("Не задан путь к codex-provider.")) }
         let process = Process()
         let output = Pipe()
@@ -321,6 +472,12 @@ final class ModelStore: ObservableObject {
         process.arguments = arguments
         process.standardOutput = output
         process.standardError = errors
+        if let stdin {
+            let input = Pipe()
+            process.standardInput = input
+            input.fileHandleForWriting.write(stdin)
+            input.fileHandleForWriting.closeFile()
+        }
 
         do {
             try process.run()
@@ -341,6 +498,26 @@ struct ContentView: View {
     @State private var searchText = ""
     @State private var priceFilter: PriceFilter = .all
     @State private var sortOrder = [KeyPathComparator(\ModelRow.valueSort, order: .reverse)]
+    @State private var showsCompactionPicker = false
+    @State private var compactionSearch = ""
+
+    private var compactionChoices: [ModelRow] {
+        let selected = store.selectedModels
+        let selectedRows = store.rows.filter { row in
+            guard let providerID = row.providerID else { return false }
+            return selected.contains { $0.providerID == providerID && $0.modelID == row.modelID }
+        }
+        return selectedRows.isEmpty ? store.rows : selectedRows
+    }
+
+    private var searchableCompactionChoices: [ModelRow] {
+        let words = compactionSearch.split(separator: " ").map { $0.lowercased() }
+        guard !words.isEmpty else { return compactionChoices }
+        return compactionChoices.filter { row in
+            let haystack = "\(row.displayName) \(row.modelID) \(row.providerName ?? "")".lowercased()
+            return words.allSatisfy { haystack.contains($0) }
+        }
+    }
 
     private var filteredRows: [ModelRow] {
         let words = searchText.split(separator: " ").map { $0.lowercased() }
@@ -389,6 +566,18 @@ struct ContentView: View {
             .background(.bar)
 
             Table(filteredRows, selection: $store.selectedRowID, sortOrder: $sortOrder) {
+                TableColumn("") { row in
+                    Toggle(
+                        "",
+                        isOn: Binding(
+                            get: { store.isSelected(row) },
+                            set: { store.setSelection(row, enabled: $0) }
+                        )
+                    )
+                    .labelsHidden()
+                }
+                .width(34)
+
                 TableColumn("Провайдер", value: \.providerNameSort) { row in
                     Text(row.providerName ?? "—")
                         .lineLimit(2)
@@ -451,21 +640,80 @@ struct ContentView: View {
                     .foregroundStyle(.secondary)
                     .lineLimit(2)
                 Spacer()
-                Button("Выбрать модель") {
-                    store.selectCurrentRow()
+            }
+            .padding(.horizontal)
+            .padding(.top, 10)
+
+            HStack(spacing: 12) {
+                Text("Выбрано: \(store.selectedModels.count)")
+                    .fontWeight(.medium)
+
+                Button {
+                    showsCompactionPicker = true
+                } label: {
+                    Label(
+                        "Компакт: \(store.selectionLabel(store.compactionModel))",
+                        systemImage: "arrow.down.circle"
+                    )
+                    .lineLimit(1)
                 }
-                .buttonStyle(.borderedProminent)
-                .disabled(store.selectedRowID == nil || store.isLoading)
+                .buttonStyle(.bordered)
+                .popover(isPresented: $showsCompactionPicker, arrowEdge: .top) {
+                    VStack(alignment: .leading, spacing: 0) {
+                        TextField("Поиск модели…", text: $compactionSearch)
+                            .textFieldStyle(.roundedBorder)
+                            .padding(10)
+                        Divider()
+                        List(searchableCompactionChoices) { row in
+                            Button {
+                                store.compactionModel = store.selection(for: row)
+                                showsCompactionPicker = false
+                                compactionSearch = ""
+                            } label: {
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(row.displayName).lineLimit(1)
+                                    Text("\(row.providerName ?? "") · \(row.modelID)")
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                        .lineLimit(1)
+                                }
+                            }
+                            .buttonStyle(.plain)
+                        }
+                        .listStyle(.plain)
+                    }
+                    .frame(width: 420, height: 360)
+                }
+
+                Spacer()
+
+                Button("Снять галочки", action: store.clearSelection)
+                    .disabled(store.selectedModels.isEmpty || store.isLoading)
+
                 Button("Проверить совместимость") {
                     store.testCurrentRow()
                 }
                 .disabled(store.selectedRowID == nil || store.isLoading)
+
+                Button("Сделать активной") {
+                    store.selectCurrentRow()
+                }
+                .disabled(store.selectedRowID == nil || store.isLoading)
+
+                Button("Включить выбранные") {
+                    store.applySelection()
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(store.selectedModels.isEmpty || store.isLoading)
             }
             .padding()
             .background(.bar)
         }
-        .frame(minWidth: 940, minHeight: 580)
-        .task { store.load() }
+        .frame(minWidth: 1040, minHeight: 620)
+        .task {
+            store.loadProxyState()
+            store.load()
+        }
     }
 }
 

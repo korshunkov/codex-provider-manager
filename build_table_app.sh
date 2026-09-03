@@ -48,11 +48,20 @@ PLIST
 /usr/bin/codesign --force --sign - "$APP"
 
 if [[ "${1:-}" == "--install" ]]; then
+    bin_dir="${HOME}/.codex/bin"
+    mkdir -p "$bin_dir"
+    /bin/ln -sfn "$ROOT/src/codex-provider" "$bin_dir/codex-provider"
+    /bin/ln -sfn "$ROOT/src/codex-provider-proxy" "$bin_dir/codex-provider-proxy"
+    if [[ -f "$ROOT/src/codex-provider-key" ]]; then
+        /bin/ln -sfn "$ROOT/src/codex-provider-key" "$bin_dir/codex-provider-key"
+    fi
+
     target="/Users/admin/Applications/Модели Codex.app"
     rm -rf "$target"
     /usr/bin/ditto "$APP" "$target"
     /usr/bin/codesign --force --sign - "$target"
     print "Установлено: $target"
+    print "CLI обновлён: $bin_dir/codex-provider"
 else
     print "Собрано: $APP"
 fi

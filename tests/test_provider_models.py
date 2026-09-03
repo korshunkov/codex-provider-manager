@@ -9,16 +9,23 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from provider_models import (  # noqa: E402
+    PROXY_SHELF_LIMIT,
     SHELF_LIMIT,
     _is_free_openrouter_model,
+    build_proxy_shelf,
     build_shelf,
     a6_marketplace_estimates,
+    compaction_selection,
     find_model,
     merge_a6_marketplace_prices,
     merge_artificial_analysis_from_reference,
     merge_context_window_from_reference,
     merge_reasoning_from_reference,
     normalize_model,
+    proxy_model_id,
+    proxy_selections,
+    set_compaction_model,
+    set_selected_model,
     _with_model_fields,
 )
 
@@ -65,6 +72,76 @@ class ProviderModelsTests(unittest.TestCase):
         shelf = build_shelf("anymodel", {"model": "vendor/model-2"}, models, state, "vendor/model-40")
         self.assertEqual(len(shelf), SHELF_LIMIT)
         self.assertEqual(shelf[0]["id"], "vendor/model-40")
+
+    def test_proxy_selections_keep_user_order_and_support_clearing(self) -> None:
+        state = {"selected_models": [], "compaction_model": None}
+        set_selected_model(state, "anymodel", "am/kimi-k3", True)
+        set_selected_model(state, "a6api", "kimi-k3", True)
+        set_selected_model(state, "anymodel", "am/kimi-k3", False)
+        set_selected_model(state, "openrouter-all", "z-ai/glm-5.3", True)
+        self.assertEqual(
+            proxy_selections(state),
+            [
+                {"provider_id": "openrouter-all", "model_id": "z-ai/glm-5.3"},
+                {"provider_id": "a6api", "model_id": "kimi-k3"},
+            ],
+        )
+        set_compaction_model(state, "a6api", "kimi-k3")
+        self.assertEqual(
+            compaction_selection(state),
+            {"provider_id": "a6api", "model_id": "kimi-k3"},
+        )
+
+    def test_proxy_names_are_short_and_catalog_keeps_selection_order(self) -> None:
+        state = {
+            "selected_models": [
+                {"provider_id": "openrouter-all", "model_id": "z-ai/glm-5.3"},
+                {"provider_id": "a6api", "model_id": "kimi-k3"},
+                {"provider_id": "anymodel", "model_id": "am/kimi-k3"},
+            ],
+            "compaction_model": {"provider_id": "a6api", "model_id": "kimi-k3"},
+        }
+        models = {
+            "openrouter-all": [model("z-ai/glm-5.3")],
+            "a6api": [model("kimi-k3")],
+            "anymodel": [model("am/kimi-k3")],
+        }
+        self.assertEqual(proxy_model_id("a6api", "kimi-k3"), "a6/kimi-k3")
+        self.assertEqual(proxy_model_id("anymodel", "am/kimi-k3"), "am/kimi-k3")
+        shelf = build_proxy_shelf(state, models)
+        self.assertEqual(
+            [item["id"] for item in shelf],
+            ["or/z-ai/glm-5.3", "a6/kimi-k3", "am/kimi-k3"],
+        )
+
+    def test_proxy_catalog_adds_active_but_not_automatic_favorites(self) -> None:
+        state = {
+            "selected_models": [{"provider_id": "a6api", "model_id": "kimi-k3"}],
+            "compaction_model": None,
+            "favorites": {"a6api": ["hidden-model"]},
+        }
+        models = {
+            "a6api": [model("kimi-k3"), model("hidden-model")],
+            "anymodel": [model("am/kimi-k3")],
+        }
+        shelf = build_proxy_shelf(
+            state,
+            models,
+            active={"provider_id": "anymodel", "model_id": "am/kimi-k3"},
+        )
+        self.assertEqual([item["id"] for item in shelf], ["a6/kimi-k3", "am/kimi-k3"])
+
+    def test_proxy_catalog_is_limited(self) -> None:
+        state = {
+            "selected_models": [
+                {"provider_id": "a6api", "model_id": f"model-{index}"}
+                for index in range(PROXY_SHELF_LIMIT + 10)
+            ],
+            "compaction_model": None,
+        }
+        models = {"a6api": [model(f"model-{index}") for index in range(PROXY_SHELF_LIMIT + 10)]}
+        shelf = build_proxy_shelf(state, models)
+        self.assertEqual(len(shelf), PROXY_SHELF_LIMIT)
 
     def test_reasoning_can_be_filled_from_unique_reference_model(self) -> None:
         a6_model = model("glm-5.3-flash")
