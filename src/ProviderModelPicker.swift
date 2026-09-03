@@ -142,6 +142,7 @@ struct ProxyApplyResponse: Decodable {
 
 enum PriceFilter: String, CaseIterable, Identifiable {
     case all
+    case selected
     case withPrice
     case free
     case withIndex
@@ -150,6 +151,7 @@ enum PriceFilter: String, CaseIterable, Identifiable {
     var title: String {
         switch self {
         case .all: "Все модели"
+        case .selected: "Выбранные"
         case .withPrice: "С ценой"
         case .free: "Бесплатные"
         case .withIndex: "С индексом"
@@ -500,6 +502,7 @@ struct ContentView: View {
     @State private var sortOrder = [KeyPathComparator(\ModelRow.valueSort, order: .reverse)]
     @State private var showsCompactionPicker = false
     @State private var compactionSearch = ""
+    @State private var pinnedSelectionKeys: Set<String> = []
 
     private var compactionChoices: [ModelRow] {
         let selected = store.selectedModels
@@ -527,6 +530,9 @@ struct ContentView: View {
             let matchesFilter: Bool
             switch priceFilter {
             case .all: matchesFilter = true
+            case .selected:
+                let selectionKey = "\(row.providerID ?? "single")|\(row.modelID)"
+                matchesFilter = store.isSelected(row) || pinnedSelectionKeys.contains(selectionKey)
             case .withPrice: matchesFilter = row.inputPrice != nil || row.outputPrice != nil
             case .free: matchesFilter = row.inputPrice == 0 || row.outputPrice == 0
             case .withIndex: matchesFilter = row.codexIndex != nil
@@ -553,6 +559,12 @@ struct ContentView: View {
                     }
                 }
                 .frame(maxWidth: 180)
+                .help("«Выбранные»: после снятия галочки модель остаётся в списке до смены фильтра")
+                .onChange(of: priceFilter) { _, newValue in
+                    if newValue != .selected {
+                        pinnedSelectionKeys.removeAll()
+                    }
+                }
 
                 TextField("Поиск: GLM, GPT, Claude…", text: $searchText)
                     .textFieldStyle(.roundedBorder)
@@ -571,7 +583,12 @@ struct ContentView: View {
                         "",
                         isOn: Binding(
                             get: { store.isSelected(row) },
-                            set: { store.setSelection(row, enabled: $0) }
+                            set: { enabled in
+                                if enabled, priceFilter == .selected {
+                                    pinnedSelectionKeys.insert("\(row.providerID ?? "single")|\(row.modelID)")
+                                }
+                                store.setSelection(row, enabled: enabled)
+                            }
                         )
                     )
                     .labelsHidden()
