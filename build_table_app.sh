@@ -52,6 +52,9 @@ if [[ "${1:-}" == "--install" ]]; then
     mkdir -p "$bin_dir"
     /bin/ln -sfn "$ROOT/src/codex-provider" "$bin_dir/codex-provider"
     /bin/ln -sfn "$ROOT/src/codex-provider-proxy" "$bin_dir/codex-provider-proxy"
+    /bin/rm -f "$bin_dir/codex-power-watch"
+    /bin/cp "$ROOT/src/codex-power-watch" "$bin_dir/codex-power-watch"
+    /bin/chmod 755 "$bin_dir/codex-power-watch"
     if [[ -f "$ROOT/src/codex-provider-key" ]]; then
         /bin/ln -sfn "$ROOT/src/codex-provider-key" "$bin_dir/codex-provider-key"
     fi

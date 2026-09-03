@@ -140,6 +140,26 @@ struct ProxyApplyResponse: Decodable {
     }
 }
 
+struct PowerWatchStateResponse: Decodable {
+    let running: Bool
+    let codexActive: Bool
+    let batterySleepDisabled: Bool
+    let networkAvailable: Bool
+    let networkMissingSeconds: Int
+    let networkSleepRequested: Bool
+    let updatedAt: String?
+
+    enum CodingKeys: String, CodingKey {
+        case running
+        case codexActive = "codex_active"
+        case batterySleepDisabled = "battery_sleep_disabled"
+        case networkAvailable = "network_available"
+        case networkMissingSeconds = "network_missing_seconds"
+        case networkSleepRequested = "network_sleep_requested"
+        case updatedAt = "updated_at"
+    }
+}
+
 enum PriceFilter: String, CaseIterable, Identifiable {
     case all
     case selected
@@ -170,6 +190,12 @@ final class ModelStore: ObservableObject {
     @Published var selectedModels: [ProxySelection] = []
     @Published var compactionModel: ProxySelection?
     @Published var proxyRunning = false
+    @Published var powerWatchRunning = false
+    @Published var powerWatchCodexActive = false
+    @Published var powerWatchNetworkAvailable = true
+    @Published var powerWatchNetworkMissingSeconds = 0
+    @Published var powerWatchStatus = "Защита от сна выключена."
+    @Published var isPowerWatchBusy = false
 
     let providers = [
         ProviderOption(id: "all", name: "Все провайдеры"),
@@ -186,6 +212,7 @@ final class ModelStore: ObservableObject {
     ]
 
     private let cliURL = URL(fileURLWithPath: "/Users/admin/.local/bin/codex-provider")
+    private let powerWatchURL = URL(fileURLWithPath: "/Users/admin/.codex/bin/codex-power-watch")
 
     func loadProxyState() {
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
@@ -204,6 +231,76 @@ final class ModelStore: ObservableObject {
                     }
                 case .failure(.message(let error)):
                     self.status = "Прокси недоступен: \(error)"
+                }
+            }
+        }
+    }
+
+    func loadPowerWatchState() {
+        guard !isPowerWatchBusy else { return }
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            let result = Self.runProcess(self?.powerWatchURL, arguments: ["status", "--json"])
+            DispatchQueue.main.async {
+                guard let self else { return }
+                switch result {
+                case .success(let output):
+                    do {
+                        let state = try JSONDecoder().decode(PowerWatchStateResponse.self, from: output)
+                        self.applyPowerWatchState(state)
+                    } catch {
+                        self.powerWatchRunning = false
+                        self.powerWatchStatus = "Не удалось прочитать состояние защиты от сна."
+                    }
+                case .failure(.message(let error)):
+                    self.powerWatchRunning = false
+                    self.powerWatchStatus = "Защита от сна недоступна: \(error)"
+                }
+            }
+        }
+    }
+
+    private func applyPowerWatchState(_ state: PowerWatchStateResponse) {
+        powerWatchRunning = state.running
+        powerWatchCodexActive = state.codexActive
+        powerWatchNetworkAvailable = state.networkAvailable
+        powerWatchNetworkMissingSeconds = state.networkMissingSeconds
+
+        guard state.running else {
+            powerWatchStatus = "Защита от сна выключена."
+            return
+        }
+
+        let codex = state.codexActive ? "Codex активен" : "Codex не активен"
+        let network = state.networkAvailable
+            ? "сеть есть"
+            : "сети нет \(state.networkMissingSeconds) сек"
+        let sleep = state.batterySleepDisabled ? "; сон запрещён" : ""
+        let pending = state.networkSleepRequested ? "; отправлен в сон" : ""
+        powerWatchStatus = "\(codex), \(network)\(sleep)\(pending)."
+    }
+
+    func setPowerWatch(_ enabled: Bool) {
+        guard !isPowerWatchBusy, powerWatchRunning != enabled else { return }
+        isPowerWatchBusy = true
+        powerWatchRunning = enabled
+        powerWatchStatus = enabled ? "Включаю защиту от сна…" : "Выключаю защиту от сна…"
+
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let result = Self.runProcess(self?.powerWatchURL, arguments: [enabled ? "start" : "stop"])
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.isPowerWatchBusy = false
+                switch result {
+                case .success(let output):
+                    let message = String(data: output, encoding: .utf8)?
+                        .trimmingCharacters(in: .whitespacesAndNewlines)
+                    if let message, !message.isEmpty {
+                        self.powerWatchStatus = message.replacingOccurrences(of: "\n", with: " ")
+                    }
+                    self.loadPowerWatchState()
+                case .failure(.message(let error)):
+                    self.powerWatchStatus = error
+                    self.loadPowerWatchState()
                 }
             }
         }
@@ -661,6 +758,25 @@ struct ContentView: View {
             .padding(.horizontal)
             .padding(.top, 10)
 
+            HStack(spacing: 10) {
+                Toggle("Защита от сна", isOn: Binding(
+                    get: { store.powerWatchRunning },
+                    set: { store.setPowerWatch($0) }
+                ))
+                .toggleStyle(.switch)
+                .disabled(store.isPowerWatchBusy)
+                .help("Пока Codex работает, Mac не засыпает. Если сеть недоступна более минуты, Mac уходит в сон.")
+
+                Text(store.powerWatchStatus)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+
+                Spacer()
+            }
+            .padding(.horizontal)
+            .padding(.bottom, 4)
+
             HStack(spacing: 12) {
                 Text("Выбрано: \(store.selectedModels.count)")
                     .fontWeight(.medium)
@@ -730,6 +846,10 @@ struct ContentView: View {
         .task {
             store.loadProxyState()
             store.load()
+            while !Task.isCancelled {
+                store.loadPowerWatchState()
+                try? await Task.sleep(nanoseconds: 5_000_000_000)
+            }
         }
     }
 }
@@ -741,5 +861,10 @@ struct ProviderModelPickerApp: App {
             ContentView()
         }
         .windowResizability(.contentMinSize)
+
+        Settings {
+            Text("Дополнительные настройки не требуются.")
+                .padding()
+        }
     }
 }

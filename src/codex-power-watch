@@ -1,0 +1,337 @@
+#!/opt/homebrew/bin/python3
+"""Keep a MacBook awake during active Codex work and restore sleep after it."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+from pathlib import Path
+import shlex
+import signal
+import subprocess
+import sys
+import time
+
+
+CODEX_HOME = Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex"))).expanduser()
+PID_PATH = CODEX_HOME / "codex-power-watch.pid"
+STATE_PATH = CODEX_HOME / "codex-power-watch-state.json"
+LOG_PATH = CODEX_HOME / "codex-power-watch.log"
+POLL_SECONDS = 5
+NETWORK_LOSS_SLEEP_SECONDS = 60
+
+
+def is_active_codex_assertion(assertions: str) -> bool:
+    """ChatGPT/Codex creates a no-idle assertion only while work is running."""
+    for line in assertions.splitlines():
+        lowered = line.lower()
+        if "noidlesleepassertion" not in lowered:
+            continue
+        if "(chatgpt):" in lowered or "(codex):" in lowered:
+            return True
+    return False
+
+
+def current_codex_assertion() -> bool:
+    result = subprocess.run(
+        ["/usr/bin/pmset", "-g", "assertions"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return is_active_codex_assertion(result.stdout)
+
+
+def network_available() -> bool:
+    # HTTPS can be blocked by a local proxy, so availability is an ICMP check.
+    for host in ("1.1.1.1", "8.8.8.8"):
+        result = subprocess.run(
+            ["/sbin/ping", "-c", "1", "-W", "2000", host],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        if result.returncode == 0:
+            return True
+    return False
+
+
+def should_sleep_for_network_loss(missing_seconds: float, sleep_already_requested: bool) -> bool:
+    return missing_seconds >= NETWORK_LOSS_SLEEP_SECONDS and not sleep_already_requested
+
+
+def set_battery_sleep_disabled(disabled: bool) -> None:
+    subprocess.run(
+        ["/usr/bin/pmset", "-b", "disablesleep", "1" if disabled else "0"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+
+def write_state(
+    pid: int,
+    active: bool,
+    enabled: bool,
+    network: bool = True,
+    outage_seconds: float = 0.0,
+    sleep_requested: bool = False,
+) -> None:
+    payload = {
+        "pid": pid,
+        "codex_active": active,
+        "battery_sleep_disabled": enabled,
+        "network_available": network,
+        "network_missing_seconds": round(outage_seconds),
+        "network_sleep_requested": sleep_requested,
+        "updated_at": time.strftime("%Y-%m-%d %H:%M:%S%z"),
+    }
+    STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    STATE_PATH.write_text(json.dumps(payload, ensure_ascii=False) + "\n", encoding="utf-8")
+
+
+def log(message: str) -> None:
+    with LOG_PATH.open("a", encoding="utf-8") as log_file:
+        log_file.write(f"{time.strftime('%Y-%m-%d %H:%M:%S%z')} {message}\n")
+
+
+def running_pid() -> int | None:
+    try:
+        pid = int(PID_PATH.read_text(encoding="ascii").strip())
+        os.kill(pid, 0)
+        return pid
+    except FileNotFoundError:
+        return None
+    except ProcessLookupError:
+        return None
+    except ValueError:
+        return None
+    except PermissionError:
+        # A process owned by root still exists even when this user cannot signal it.
+        return pid
+    except OSError:
+        return None
+
+
+def cleanup() -> None:
+    PID_PATH.unlink(missing_ok=True)
+    STATE_PATH.unlink(missing_ok=True)
+
+
+def run() -> None:
+    if os.geteuid() != 0:
+        raise SystemExit("Нужны права администратора. Запустите: sudo codex-power-watch start")
+    if running_pid() is not None:
+        raise SystemExit("Наблюдатель уже запущен.")
+
+    stop_requested = False
+
+    def request_stop(_: int, __: object) -> None:
+        nonlocal stop_requested
+        stop_requested = True
+
+    signal.signal(signal.SIGTERM, request_stop)
+    signal.signal(signal.SIGINT, request_stop)
+
+    PID_PATH.parent.mkdir(parents=True, exist_ok=True)
+    PID_PATH.write_text(f"{os.getpid()}\n", encoding="ascii")
+    enabled = False
+    outage_started = None
+    sleep_requested = False
+    log("Наблюдатель запущен.")
+
+    try:
+        while not stop_requested:
+            active = current_codex_assertion()
+            network = network_available()
+
+            if network:
+                outage_started = None
+                sleep_requested = False
+            elif outage_started is None:
+                outage_started = time.monotonic()
+
+            outage_seconds = 0.0 if outage_started is None else time.monotonic() - outage_started
+            if should_sleep_for_network_loss(outage_seconds, sleep_requested):
+                if enabled:
+                    set_battery_sleep_disabled(False)
+                    enabled = False
+                sleep_requested = True
+                write_state(os.getpid(), active, False, network, outage_seconds, True)
+                log(f"Сеть недоступна {int(outage_seconds)} сек; отправляю Mac в сон.")
+                subprocess.run(["/usr/bin/pmset", "sleepnow"], check=True)
+            else:
+                desired_enabled = active
+                if desired_enabled != enabled:
+                    set_battery_sleep_disabled(desired_enabled)
+                    enabled = desired_enabled
+                    action = "запрещает сон на батарее" if active else "возвращает обычный сон"
+                    log(f"Codex {'активен; наблюдатель ' if active else 'неактивен; наблюдатель '}{action}.")
+                write_state(os.getpid(), active, enabled, network, outage_seconds, sleep_requested)
+
+            for _ in range(POLL_SECONDS * 10):
+                if stop_requested:
+                    break
+                time.sleep(0.1)
+    finally:
+        try:
+            set_battery_sleep_disabled(False)
+            log("Наблюдатель остановлен; обычный сон на батарее возвращён.")
+        except Exception as error:
+            log(f"Не удалось вернуть обычный сон: {error}")
+        cleanup()
+
+
+def run_admin_shell(shell_command: str) -> None:
+    # AppleScript needs its own string literal; shell quoting (shlex.quote)
+    # produces single-quoted shell syntax, which is not valid here.
+    apple_script = (
+        f"do shell script {json.dumps(shell_command, ensure_ascii=False)} "
+        "with administrator privileges"
+    )
+    try:
+        subprocess.run(
+            ["/usr/bin/osascript", "-e", apple_script],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except subprocess.CalledProcessError as error:
+        details = (error.stderr or error.stdout or "").strip()
+        raise SystemExit(f"Запрос прав администратора не выполнен. {details}".strip())
+
+
+def start() -> None:
+    if os.geteuid() == 0:
+        run()
+        return
+    if running_pid() is not None:
+        raise SystemExit("Наблюдатель уже запущен.")
+    script = shlex.quote(str(Path(__file__).resolve()))
+    # `osascript ... with administrator privileges` runs as root and changes
+    # HOME to /var/root. Keep the observer's files in the user's Codex home so
+    # the GUI and the non-root status command see the same PID/state.
+    codex_home = shlex.quote(str(CODEX_HOME))
+    command = (
+        f"env CODEX_HOME={codex_home} "
+        f"{shlex.quote(sys.executable)} {script} spawn"
+    )
+    run_admin_shell(command)
+    for _ in range(30):
+        pid = running_pid()
+        if pid is not None:
+            print(f"Наблюдатель запущен (PID {pid}).")
+            print("Он включит защиту только во время активной задачи Codex.")
+            return
+        time.sleep(0.1)
+    raise SystemExit("Наблюдатель не запустился. Подробности: ~/.codex/codex-power-watch.log")
+
+
+def spawn() -> None:
+    """Start the privileged polling loop detached from the authorization UI."""
+    if os.geteuid() != 0:
+        raise SystemExit("Внутренняя команда доступна только с правами администратора.")
+    script = str(Path(__file__).resolve())
+    environment = os.environ.copy()
+    environment["CODEX_HOME"] = str(CODEX_HOME)
+    subprocess.Popen(
+        [sys.executable, script, "run"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+        close_fds=True,
+        env=environment,
+    )
+
+
+def stop() -> None:
+    pid = running_pid()
+    if pid is None:
+        cleanup()
+        print("Наблюдатель не запущен.")
+        return
+    if os.geteuid() == 0:
+        os.kill(pid, signal.SIGTERM)
+    else:
+        run_admin_shell(f"kill -TERM {pid}")
+    for _ in range(50):
+        if running_pid() is None:
+            print("Наблюдатель остановлен; обычный сон возвращён.")
+            return
+        time.sleep(0.1)
+    print("Наблюдатель ещё завершается; проверьте состояние через секунду.")
+
+
+def status(json_output: bool = False) -> None:
+    pid = running_pid()
+    state: dict[str, object] = {}
+    try:
+        loaded = json.loads(STATE_PATH.read_text(encoding="utf-8"))
+        if isinstance(loaded, dict):
+            state = loaded
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        pass
+
+    payload = {
+        "running": pid is not None,
+        "pid": pid,
+        "codex_active": bool(state.get("codex_active", False)),
+        "battery_sleep_disabled": bool(state.get("battery_sleep_disabled", False)),
+        "network_available": bool(state.get("network_available", True)),
+        "network_missing_seconds": int(state.get("network_missing_seconds", 0)),
+        "network_sleep_requested": bool(state.get("network_sleep_requested", False)),
+        "updated_at": str(state.get("updated_at", "")) if pid is not None else "",
+    }
+
+    if json_output:
+        print(json.dumps(payload, ensure_ascii=False))
+        return
+
+    if pid is None:
+        print("Наблюдатель не запущен.")
+        return
+
+    network_text = "да" if payload["network_available"] else "нет"
+    missing = int(payload["network_missing_seconds"])
+    network_line = f"Сеть доступна: {network_text}."
+    if missing:
+        network_line += f" Без сети: {missing} сек."
+    print(f"Наблюдатель работает (PID {pid}).")
+    print(f"Codex активен: {'да' if payload['codex_active'] else 'нет'}.")
+    print(f"Сон на батарее запрещён: {'да' if payload['battery_sleep_disabled'] else 'нет'}.")
+    print(network_line)
+    print(f"Обновлено: {payload['updated_at'] or 'неизвестно'}.")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="codex-power-watch",
+        description="Запрещает сон MacBook только во время активной работы Codex.",
+    )
+    actions = parser.add_subparsers(dest="action", required=True)
+    actions.add_parser("start", help="запустить фоновый наблюдатель")
+    actions.add_parser("stop", help="остановить наблюдатель")
+    status_action = actions.add_parser("status", help="показать состояние")
+    status_action.add_argument("--json", action="store_true", help="вывести состояние в JSON")
+    actions.add_parser("run", help="запустить наблюдатель в текущем окне")
+    actions.add_parser("spawn", help=argparse.SUPPRESS)
+    return parser
+
+
+def main() -> None:
+    arguments = build_parser().parse_args()
+    if arguments.action == "start":
+        start()
+    elif arguments.action == "stop":
+        stop()
+    elif arguments.action == "status":
+        status(json_output=arguments.json)
+    elif arguments.action == "spawn":
+        spawn()
+    else:
+        run()
+
+
+if __name__ == "__main__":
+    main()
