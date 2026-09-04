@@ -77,14 +77,26 @@ def toml_string(value: str) -> str:
 
 def table_header(line: str) -> str | None:
     stripped = line.strip()
-    if not (stripped.startswith("[") and stripped.endswith("]")):
+    if not stripped.startswith("["):
         return None
-    return stripped.strip("[]").replace('"', "").replace("'", "").replace(" ", "")
+    end = stripped.rfind("]")
+    trailing = stripped[end + 1 :].strip()
+    if trailing and not trailing.startswith("#"):
+        return None
+
+    header = stripped[1:end]
+    if header.startswith("[") and header.endswith("]"):
+        header = header[1:-1]
+    return header.replace('"', "").replace("'", "").replace(" ", "")
 
 
 def is_provider_table(header: str | None) -> bool:
     if header is None:
         return False
+    if header == f"model_providers.{SESSION_PROVIDER_ID}" or header.startswith(
+        f"model_providers.{SESSION_PROVIDER_ID}."
+    ):
+        return True
     return any(header == f"model_providers.{name}" or header.startswith(f"model_providers.{name}.") for name in PROVIDERS)
 
 
