@@ -15,6 +15,7 @@ from provider_models import (  # noqa: E402
     build_proxy_shelf,
     build_shelf,
     a6_marketplace_estimates,
+    _catalog_display_name,
     compaction_selection,
     find_model,
     merge_a6_marketplace_prices,
@@ -92,7 +93,7 @@ class ProviderModelsTests(unittest.TestCase):
             {"provider_id": "a6api", "model_id": "kimi-k3"},
         )
 
-    def test_proxy_names_are_short_and_catalog_keeps_selection_order(self) -> None:
+    def test_proxy_names_are_short_and_catalog_sorts_by_index(self) -> None:
         state = {
             "selected_models": [
                 {"provider_id": "openrouter-all", "model_id": "z-ai/glm-5.3"},
@@ -106,12 +107,24 @@ class ProviderModelsTests(unittest.TestCase):
             "a6api": [model("kimi-k3")],
             "anymodel": [model("am/kimi-k3")],
         }
+        models["openrouter-all"][0].update({
+            "agentic_index": 40.0, "coding_index": 50.0, "intelligence_index": 45.0,
+            "input_price_per_million": 1.0, "output_price_per_million": 2.0,
+        })
+        models["a6api"][0].update({
+            "agentic_index": 60.0, "coding_index": 70.0, "intelligence_index": 55.0,
+            "input_price_per_million": 1.0, "output_price_per_million": 2.0,
+        })
         self.assertEqual(proxy_model_id("a6api", "kimi-k3"), "a6/kimi-k3")
         self.assertEqual(proxy_model_id("anymodel", "am/kimi-k3"), "am/kimi-k3")
         shelf = build_proxy_shelf(state, models)
         self.assertEqual(
             [item["id"] for item in shelf],
-            ["or/z-ai/glm-5.3", "a6/kimi-k3", "am/kimi-k3"],
+            ["a6/kimi-k3", "or/z-ai/glm-5.3", "am/kimi-k3"],
+        )
+        self.assertEqual(
+            _catalog_display_name(shelf[0]),
+            "a6/kimi-k3 | 62.0 | 52",
         )
 
     def test_proxy_catalog_adds_active_but_not_automatic_favorites(self) -> None:

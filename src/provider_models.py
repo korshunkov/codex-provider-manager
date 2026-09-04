@@ -158,13 +158,46 @@ def compaction_selection(state: dict[str, Any]) -> dict[str, str] | None:
     )
 
 
+def _codex_index(model: dict[str, Any]) -> float | None:
+    """The same weighted score as the local model-picker table."""
+    agentic = _positive_float(model.get("agentic_index"))
+    coding = _positive_float(model.get("coding_index"))
+    intelligence = _positive_float(model.get("intelligence_index"))
+    if agentic is None or coding is None or intelligence is None:
+        return None
+    return agentic * 0.5 + coding * 0.3 + intelligence * 0.2
+
+
+def _codex_value(model: dict[str, Any], index: float | None) -> float | None:
+    """Codex score divided by the 80/20 blended token price."""
+    input_price = _positive_float(model.get("input_price_per_million"))
+    output_price = _positive_float(model.get("output_price_per_million"))
+    if index is None or input_price is None or output_price is None:
+        return None
+    weighted_cost = input_price * 0.8 + output_price * 0.2
+    return index / weighted_cost if weighted_cost > 0 else None
+
+
+def _catalog_display_name(model: dict[str, Any]) -> str:
+    """Show routing name first, then quality and price efficiency."""
+    index = _codex_index(model)
+    value = _codex_value(model, index)
+    prices = (
+        _positive_float(model.get("input_price_per_million")),
+        _positive_float(model.get("output_price_per_million")),
+    )
+    value_text = f"{value:.0f}" if value is not None else "∞" if index is not None and prices == (0.0, 0.0) else "—"
+    index_text = f"{index:.1f}" if index is not None else "—"
+    return f"{model['id']} | {index_text} | {value_text}"
+
+
 def build_proxy_shelf(
     state: dict[str, Any],
     models_by_provider: dict[str, list[dict[str, Any]]],
     active: dict[str, str] | None = None,
     compaction: dict[str, str] | None = None,
 ) -> list[dict[str, Any]]:
-    """Build a Codex catalog from explicit selections, in selection order."""
+    """Build a Codex catalog from explicit selections, smartest models first."""
     selected = proxy_selections(state)
     for item in (active, compaction):
         if not item:
@@ -194,6 +227,10 @@ def build_proxy_shelf(
         external_model["id"] = proxy_model_id(provider_id, model_id)
         if not any(existing["id"] == external_model["id"] for existing in shelf):
             shelf.append(external_model)
+    shelf.sort(
+        key=lambda model: _codex_index(model) or float("-inf"),
+        reverse=True,
+    )
     return shelf[:PROXY_SHELF_LIMIT]
 
 
@@ -741,7 +778,12 @@ def write_codex_catalog(
     # used by the newest OpenAI models.
     fallback = bundled_by_slug.get("gpt-5.4") or bundled["models"][0]
     catalog_models = []
-    for priority, model in enumerate(shelf, start=1):
+    ordered_shelf = sorted(
+        shelf,
+        key=lambda model: _codex_index(model) or float("-inf"),
+        reverse=True,
+    )
+    for priority, model in enumerate(ordered_shelf, start=1):
         source = bundled_by_slug.get(model["id"])
         if source is None:
             short_name = model["id"].rsplit("/", 1)[-1]
@@ -749,7 +791,7 @@ def write_codex_catalog(
             source = matches[0] if len(matches) == 1 else None
         entry = deepcopy(source or fallback)
         entry["slug"] = model["id"]
-        entry["display_name"] = source.get("display_name") if source else model["display_name"]
+        entry["display_name"] = _catalog_display_name(model)
         entry["description"] = model["description"]
         entry["default_reasoning_level"] = model["default_reasoning_level"]
         entry["supported_reasoning_levels"] = [
