@@ -59,7 +59,7 @@ if [[ "${1:-}" == "--install" ]]; then
         /bin/ln -sfn "$ROOT/src/codex-provider-key" "$bin_dir/codex-provider-key"
     fi
 
-    target="/Users/admin/Applications/Модели Codex.app"
+    target="$HOME/Applications/Модели Codex.app"
     rm -rf "$target"
     /usr/bin/ditto "$APP" "$target"
     /usr/bin/codesign --force --sign - "$target"

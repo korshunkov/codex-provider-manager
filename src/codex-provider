@@ -20,6 +20,7 @@ import urllib.error
 import urllib.request
 
 from provider_models import (
+    DEFAULT_PROVIDERS,
     build_proxy_shelf,
     build_shelf,
     compaction_selection,
@@ -30,12 +31,15 @@ from provider_models import (
     merge_a6_marketplace_prices,
     merge_artificial_analysis_from_reference,
     merge_context_window_from_reference,
+    provider_definition,
+    provider_definitions,
     merge_reasoning_from_reference,
     proxy_model_id,
     proxy_selections,
     remember_model,
     save_state,
     search_models,
+    set_auto_compact_settings,
     set_compaction_model,
     set_favorite,
     set_selected_model,
@@ -65,51 +69,7 @@ DISPLAY_NAME = "OpenAI"
 SESSION_PROVIDER_ID = "codex-sale"
 COMPATIBILITY_TEST_ATTEMPTS = 1
 
-PROVIDERS = {
-    "codex-sale": {
-        "label": "Codex Sale",
-        "base_url": "https://codex.sale/backend-api/codex",
-        "supports_websockets": True,
-        "model": "gpt-5.6-terra",
-        "reasoning": "high",
-    },
-    "vibecode": {
-        "label": "VibeCode",
-        "base_url": "https://vibecode.moe/v1",
-        "supports_websockets": False,
-        "model": "gpt-5.6-terra",
-        "reasoning": "high",
-    },
-    "anymodel": {
-        "label": "AnyModel",
-        "base_url": "https://anymodel.org/v1",
-        "supports_websockets": False,
-        "model": "gpt-5.6-terra",
-        "reasoning": "high",
-    },
-    "a6api": {
-        "label": "A6 API",
-        "base_url": "https://api.a6api.com/v1",
-        "supports_websockets": False,
-        "model": "gpt-5.6-terra",
-        "reasoning": "high",
-    },
-    "openrouter": {
-        "label": "OpenRouter — бесплатные модели",
-        "base_url": "https://openrouter.ai/api/v1",
-        "supports_websockets": False,
-        "model": "openrouter/free",
-        "reasoning": "medium",
-    },
-    "openrouter-all": {
-        "label": "OpenRouter — все модели",
-        "base_url": "https://openrouter.ai/api/v1",
-        "supports_websockets": False,
-        "model": "z-ai/glm-5.3",
-        "reasoning": "high",
-    },
-}
-
+PROVIDERS = DEFAULT_PROVIDERS
 
 def toml_string(value: str) -> str:
     return json.dumps(value, ensure_ascii=False)
@@ -344,26 +304,42 @@ def save_credentials(credentials: dict[str, str]) -> None:
             temporary_path.unlink()
 
 
+def refresh_provider_registry(state: dict) -> None:
+    """Make persisted user providers visible to the current CLI process."""
+    global PROVIDERS
+    merged = dict(DEFAULT_PROVIDERS)
+    for provider_id, definition in provider_definitions(state).items():
+        previous = merged.get(provider_id, {})
+        merged[provider_id] = {
+            **definition,
+            "model": previous.get("model", ""),
+            "reasoning": previous.get("reasoning", "medium"),
+            "supports_websockets": previous.get("supports_websockets", False),
+        }
+    PROVIDERS = merged
+
+
 def available_models(provider_id: str, *, force: bool = False) -> list[dict]:
+    state = load_state(MODEL_STATE_PATH)
+    provider = provider_definition(provider_id, state) or PROVIDERS[provider_id]
     credentials = load_credentials()
-    # OpenRouter is the shared public metadata source, and its "all models"
-    # entry uses the same API key as the free-models entry.
-    credential_id = "openrouter" if provider_id in ("openrouter", "openrouter-all") else provider_id
+    credential_id = str(provider.get("credential_id", provider_id))
     try:
         models = fetch_models(
             provider_id,
-            PROVIDERS[provider_id],
+            provider,
             credentials.get(credential_id),
             MODEL_CACHE_PATH,
             force=force,
         )
-        if provider_id in ("a6api", "anymodel"):
-            # Third-party providers often omit metadata. OpenRouter is used as
-            # a reference only and never changes the endpoint used by Codex.
+        if provider_id != "openrouter-all":
+            # OpenRouter is metadata only. It never changes the endpoint or
+            # price of the selected gateway.
+            reference_provider = provider_definition("openrouter-all", state) or PROVIDERS["openrouter-all"]
             try:
                 reference_models = fetch_models(
                     "openrouter-reference",
-                    PROVIDERS["openrouter"],
+                    reference_provider,
                     credentials.get("openrouter"),
                     MODEL_CACHE_PATH,
                     force=force,
@@ -375,8 +351,6 @@ def available_models(provider_id: str, *, force: bool = False) -> list[dict]:
             except RuntimeError:
                 pass
         if provider_id == "a6api":
-            # Marketplace data is only an estimate: expensive channel halves
-            # are removed and the remaining channels are averaged.
             try:
                 estimates = load_a6_marketplace_estimates(MODEL_CACHE_PATH, force=force)
                 models = merge_a6_marketplace_prices(models, estimates)
@@ -384,29 +358,7 @@ def available_models(provider_id: str, *, force: bool = False) -> list[dict]:
                 pass
         return models
     except RuntimeError as error:
-        provider = PROVIDERS[provider_id]
-        return [
-            {
-                "id": provider["model"],
-                "display_name": provider["model"],
-                "description": f"Штатная модель {provider['label']}",
-                "context_window": 128000,
-                "context_window_source": "fallback",
-                "input_modalities": ["text", "image"],
-                "reasoning_levels": [provider["reasoning"]],
-                "default_reasoning_level": provider["reasoning"],
-                "reasoning_levels_source": "fallback",
-                "input_price_per_million": None,
-                "output_price_per_million": None,
-                "intelligence_index": None,
-                "coding_index": None,
-                "agentic_index": None,
-                "price_is_estimate": False,
-                "supports_search_tool": None,
-                "supports_function_tools": True,
-                "load_warning": str(error),
-            }
-        ]
+        raise SystemExit(f"Список моделей {provider.get('label', provider_id)} недоступен: {error}")
 
 
 def choose_model_for_provider(
@@ -431,16 +383,17 @@ def choose_model_for_provider(
     return selected or models[0]
 
 
-def external_proxy_entry(entry: dict[str, str]) -> dict[str, str]:
+def external_proxy_entry(entry: dict[str, str], state: dict | None = None) -> dict[str, str]:
+    providers = provider_definitions(state)
     return {
         "provider_id": entry["provider_id"],
         "model_id": entry["model_id"],
-        "proxy_id": proxy_model_id(entry["provider_id"], entry["model_id"]),
+        "proxy_id": proxy_model_id(entry["provider_id"], entry["model_id"], providers),
     }
 
 
 def proxy_entries(state: dict) -> list[dict[str, str]]:
-    return [external_proxy_entry(item) for item in proxy_selections(state)]
+    return [external_proxy_entry(item, state) for item in proxy_selections(state)]
 
 
 def find_current_proxy_entry(
@@ -448,11 +401,12 @@ def find_current_proxy_entry(
 ) -> dict[str, str] | None:
     if not isinstance(current_model, str):
         return None
+    providers = provider_definitions(state)
     return next(
         (
             item
             for item in selections
-            if proxy_model_id(item["provider_id"], item["model_id"]) == current_model
+            if proxy_model_id(item["provider_id"], item["model_id"], providers) == current_model
         ),
         None,
     )
@@ -484,7 +438,7 @@ def rebuild_proxy_catalog(
         compaction_selection(state),
     )
     try:
-        write_codex_catalog(MODEL_CATALOG_PATH, shelf, CODEX_BINARY, "proxy")
+        write_codex_catalog(MODEL_CATALOG_PATH, shelf, CODEX_BINARY, "proxy", state)
     except (RuntimeError, subprocess.SubprocessError, json.JSONDecodeError) as error:
         raise SystemExit(f"Не удалось создать каталог моделей Codex: {error}") from error
     return shelf
@@ -553,10 +507,11 @@ def apply_proxy_configuration(
     warnings = [
         f"{entry['model_id']} не попала в каталог Codex: достигнут лимит {len(shelf)}."
         for entry in valid
-        if proxy_model_id(entry["provider_id"], entry["model_id"]) not in represented
+        if proxy_model_id(entry["provider_id"], entry["model_id"], provider_definitions(state)) not in represented
     ]
 
-    active_proxy_id = proxy_model_id(active["provider_id"], active["model_id"])
+    providers = provider_definitions(state)
+    active_proxy_id = proxy_model_id(active["provider_id"], active["model_id"], providers)
     active_model = find_model(models_by_provider[active["provider_id"]], active["model_id"])
     assert active_model is not None
     current = CONFIG_PATH.read_text(encoding="utf-8")
@@ -679,6 +634,14 @@ def command_proxy_configure(_: argparse.Namespace) -> None:
         if isinstance(active, dict)
         else None
     )
+    if isinstance(payload.get("auto_compact"), dict):
+        compact = payload["auto_compact"]
+        try:
+            set_auto_compact_settings(
+                state, str(compact.get("mode", "percent")), int(compact.get("value", 75))
+            )
+        except (TypeError, ValueError) as error:
+            raise SystemExit(str(error))
     warnings, proxy_id = apply_proxy_configuration(
         state, selections, active=active, compaction=compaction
     )
@@ -732,7 +695,10 @@ def command_proxy_status(_: argparse.Namespace) -> None:
                 "base_url": PROXY_BASE_URL,
                 "configured": active_service(load_config()) == PROXY_TARGET_ID,
                 "selected": proxy_entries(state),
-                "compaction_model": external_proxy_entry(compaction) if compaction else None,
+                "compaction_model": external_proxy_entry(compaction, state) if compaction else None,
+                "auto_compact_mode": state.get("auto_compact_mode", "percent"),
+                "auto_compact_percent": state.get("auto_compact_percent", 75),
+                "auto_compact_tokens": state.get("auto_compact_tokens", 200_000),
             },
             ensure_ascii=False,
         )
@@ -1021,6 +987,148 @@ def command_favorite(args: argparse.Namespace) -> None:
     print(f"Модель {args.model} {action}.")
 
 
+def command_provider_settings(_: argparse.Namespace) -> None:
+    state = load_state(MODEL_STATE_PATH)
+    refresh_provider_registry(state)
+    credentials = load_credentials() if CREDENTIALS_PATH.exists() else {}
+    providers = []
+    for provider_id, provider in provider_definitions(state).items():
+        providers.append({
+            "id": provider_id,
+            "label": provider["label"],
+            "base_url": provider["base_url"],
+            "models_url": provider.get("models_url"),
+            "alias": provider["alias"],
+            "built_in": provider.get("built_in", False),
+            "has_key": bool(credentials.get(str(provider.get("credential_id", provider_id)))),
+        })
+    print(json.dumps({
+        "providers": providers,
+        "auto_compact_mode": state.get("auto_compact_mode", "percent"),
+        "auto_compact_percent": state.get("auto_compact_percent", 75),
+        "auto_compact_tokens": state.get("auto_compact_tokens", 200_000),
+    }, ensure_ascii=False))
+
+
+def command_provider_add(args: argparse.Namespace) -> None:
+    api_key = sys.stdin.read().strip() if args.api_key_stdin else ""
+    if not api_key:
+        raise SystemExit("Ключ провайдера не передан.")
+
+    label = args.label.strip()
+    prefix = args.prefix.strip().lower()
+    base_url = args.base_url.strip().rstrip("/")
+    if not label:
+        raise SystemExit("Введите название провайдера.")
+    import re
+    if not re.fullmatch(r"[a-z][a-z0-9_-]{1,15}", prefix):
+        raise SystemExit("Префикс должен быть от 2 до 16 символов: латиница, цифры, - или _, и начинаться с буквы.")
+    if not base_url.startswith(("http://", "https://")):
+        raise SystemExit("Адрес API должен начинаться с http:// или https://.")
+
+    state = load_state(MODEL_STATE_PATH)
+    definitions = provider_definitions(state)
+    if prefix in definitions:
+        raise SystemExit(f"Префикс {prefix} уже занят.")
+    definition = {
+        "id": prefix,
+        "label": label,
+        "base_url": base_url,
+        "models_url": args.models_url.strip() or None,
+        "credential_id": prefix,
+        "alias": prefix,
+        "built_in": False,
+    }
+    models_url = definition.get("models_url") or f"{base_url}/models"
+    probe = dict(definition)
+    probe["models_url"] = models_url
+    credentials = load_credentials() if CREDENTIALS_PATH.exists() else {}
+    try:
+        fetch_models(prefix, probe, api_key, MODEL_CACHE_PATH, cache_id=f"probe-{prefix}")
+    except RuntimeError as error:
+        raise SystemExit(f"Провайдер не добавлен: список моделей не загрузился ({error}).")
+
+    credentials[definition["credential_id"]] = api_key
+    save_credentials(credentials)
+    records = state.setdefault("providers", [])
+    if not isinstance(records, list):
+        state["providers"] = records = []
+    records = [item for item in records if not isinstance(item, dict) or item.get("id") != prefix]
+    records.append(definition)
+    state["providers"] = records
+    save_state(MODEL_STATE_PATH, state)
+    refresh_provider_registry(state)
+    print(f"Провайдер {label} добавлен. Список моделей загружен.")
+
+
+def command_provider_remove(args: argparse.Namespace) -> None:
+    state = load_state(MODEL_STATE_PATH)
+    definitions = provider_definitions(state)
+    provider = definitions.get(args.provider)
+    if provider is None:
+        raise SystemExit("Провайдер не найден.")
+    if provider.get("built_in"):
+        raise SystemExit("Встроенного провайдера OpenRouter удалить нельзя.")
+    state["providers"] = [
+        item for item in state.get("providers", [])
+        if not isinstance(item, dict) or item.get("id") != args.provider
+    ]
+    state["selected_models"] = [
+        item for item in state.get("selected_models", [])
+        if not isinstance(item, dict) or item.get("provider_id") != args.provider
+    ]
+    if isinstance(state.get("compaction_model"), dict) and state["compaction_model"].get("provider_id") == args.provider:
+        state["compaction_model"] = None
+    save_state(MODEL_STATE_PATH, state)
+    credentials = load_credentials() if CREDENTIALS_PATH.exists() else {}
+    credential_id = str(provider.get("credential_id", args.provider))
+    if credential_id in credentials:
+        credentials.pop(credential_id)
+        save_credentials(credentials)
+    print(f"Провайдер {provider['label']} удалён.")
+
+
+def command_provider_key(args: argparse.Namespace) -> None:
+    api_key = sys.stdin.read().strip()
+    if not api_key:
+        raise SystemExit("Ключ провайдера не передан.")
+    state = load_state(MODEL_STATE_PATH)
+    provider = provider_definition(args.provider, state)
+    if provider is None:
+        raise SystemExit("Провайдер не найден.")
+    credentials = load_credentials() if CREDENTIALS_PATH.exists() else {}
+    credentials[str(provider.get("credential_id", args.provider))] = api_key
+    save_credentials(credentials)
+    print(f"Ключ провайдера {provider['label']} сохранён.")
+
+
+def command_provider_key_show(args: argparse.Namespace) -> None:
+    state = load_state(MODEL_STATE_PATH)
+    provider = provider_definition(args.provider, state)
+    if provider is None:
+        raise SystemExit("Провайдер не найден.")
+    credentials = load_credentials() if CREDENTIALS_PATH.exists() else {}
+    key = credentials.get(str(provider.get("credential_id", args.provider)))
+    if not isinstance(key, str) or not key.strip():
+        raise SystemExit("Ключ провайдера не настроен.")
+    print(json.dumps({
+        "provider": args.provider,
+        "label": provider["label"],
+        "key": key.strip(),
+    }, ensure_ascii=False))
+
+
+def command_auto_compact(args: argparse.Namespace) -> None:
+    state = load_state(MODEL_STATE_PATH)
+    try:
+        set_auto_compact_settings(state, args.mode, args.value)
+    except ValueError as error:
+        raise SystemExit(str(error))
+    save_state(MODEL_STATE_PATH, state)
+    label = f"{args.value}%" if args.mode == "percent" else f"{args.value} токенов"
+    print(f"Настройка автокомпакта сохранена: {label}.")
+
+
 def command_set_key(args: argparse.Namespace) -> None:
     import getpass
 
@@ -1098,6 +1206,30 @@ def build_parser() -> argparse.ArgumentParser:
     proxy_stop = proxy_subcommands.add_parser("stop", help="остановить прокси")
     proxy_stop.set_defaults(handler=command_proxy_stop)
 
+    provider_settings = subcommands.add_parser("provider-settings", help="показать настройки провайдеров в JSON")
+    provider_settings.set_defaults(handler=command_provider_settings)
+    provider_add = subcommands.add_parser("provider-add", help="добавить OpenAI-совместимого провайдера")
+    provider_add.add_argument("--label", required=True)
+    provider_add.add_argument("--prefix", required=True)
+    provider_add.add_argument("--base-url", required=True)
+    provider_add.add_argument("--models-url", default="")
+    provider_add.add_argument("--api-key-stdin", action="store_true")
+    provider_add.set_defaults(handler=command_provider_add)
+    provider_remove = subcommands.add_parser("provider-remove", help="удалить добавленного провайдера")
+    provider_remove.add_argument("provider")
+    provider_remove.set_defaults(handler=command_provider_remove)
+    provider_key = subcommands.add_parser("provider-key", help="безопасно обновить ключ провайдера")
+    provider_key.add_argument("provider")
+    provider_key.add_argument("--stdin", action="store_true")
+    provider_key.set_defaults(handler=command_provider_key)
+    provider_key_show = subcommands.add_parser("provider-key-show", help="показать текущий ключ провайдера в JSON")
+    provider_key_show.add_argument("provider")
+    provider_key_show.set_defaults(handler=command_provider_key_show)
+    auto_compact = subcommands.add_parser("set-auto-compact", help="настроить уровень автокомпакта")
+    auto_compact.add_argument("--mode", choices=("percent", "tokens"), required=True)
+    auto_compact.add_argument("--value", type=int, required=True)
+    auto_compact.set_defaults(handler=command_auto_compact)
+
     set_key = subcommands.add_parser("set-key", help="безопасно заменить ключ провайдера")
     set_key.add_argument("provider", choices=PROVIDERS.keys())
     set_key.set_defaults(handler=command_set_key)
@@ -1105,6 +1237,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> None:
+    refresh_provider_registry(load_state(MODEL_STATE_PATH))
     parser = build_parser()
     arguments = parser.parse_args()
     arguments.handler(arguments)

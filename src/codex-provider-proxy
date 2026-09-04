@@ -49,10 +49,62 @@ ALIASES = {
 }
 
 
-def proxy_model_id(provider_id: str, model_id: str) -> str:
+DEFAULT_PROVIDER_MAP = {
+    "openrouter-all": {
+        "base_url": "https://openrouter.ai/api/v1",
+        "credential_id": "openrouter",
+        "alias": "or",
+    },
+    "vibecode": {
+        "base_url": "https://vibecode.moe/v1",
+        "credential_id": "vibecode",
+        "alias": "vc",
+    },
+    "anymodel": {
+        "base_url": "https://anymodel.org/v1",
+        "credential_id": "anymodel",
+        "alias": "am",
+    },
+    "a6api": {
+        "base_url": "https://api.a6api.com/v1",
+        "credential_id": "a6api",
+        "alias": "a6",
+    },
+}
+
+
+def provider_map(state: dict[str, Any]) -> dict[str, dict[str, str]]:
+    providers = dict(DEFAULT_PROVIDER_MAP)
+    records = state.get("providers", [])
+    if isinstance(records, list):
+        for item in records:
+            if not isinstance(item, dict):
+                continue
+            provider_id = str(item.get("id", "")).strip()
+            base_url = str(item.get("base_url", "")).strip()
+            alias = str(item.get("alias", "")).strip()
+            if provider_id and base_url.startswith(("http://", "https://")) and alias:
+                providers[provider_id] = {
+                    "base_url": base_url.rstrip("/"),
+                    "credential_id": str(item.get("credential_id", provider_id)),
+                    "alias": alias,
+                }
+    return providers
+
+
+def proxy_model_id(
+    provider_id: str,
+    model_id: str,
+    providers: dict[str, dict[str, str]] | None = None,
+) -> str:
+    if providers is None:
+        if provider_id == "anymodel" and model_id.startswith("am/"):
+            return model_id
+        alias = ALIASES.get(provider_id)
+        return f"{alias}/{model_id}" if alias else model_id
     if provider_id == "anymodel" and model_id.startswith("am/"):
         return model_id
-    alias = ALIASES.get(provider_id)
+    alias = providers.get(provider_id, {}).get("alias", "")
     return f"{alias}/{model_id}" if alias else model_id
 
 
@@ -73,7 +125,7 @@ def selected_models(state: dict[str, Any]) -> list[dict[str, str]]:
         provider_id = str(item.get("provider_id", ""))
         model_id = str(item.get("model_id", ""))
         key = f"{provider_id}|{model_id}"
-        if provider_id in PROVIDERS and model_id and key not in seen:
+        if provider_id in provider_map(state) and model_id and key not in seen:
             seen.add(key)
             result.append({"provider_id": provider_id, "model_id": model_id})
     return result
@@ -85,7 +137,7 @@ def compaction_model(state: dict[str, Any]) -> dict[str, str] | None:
         return None
     provider_id = str(item.get("provider_id", ""))
     model_id = str(item.get("model_id", ""))
-    if provider_id in PROVIDERS and model_id:
+    if provider_id in provider_map(state) and model_id:
         return {"provider_id": provider_id, "model_id": model_id}
     return None
 
@@ -96,7 +148,7 @@ def model_route(state: dict[str, Any], external_id: str) -> dict[str, str] | Non
     if compaction:
         candidates.append(compaction)
     for item in candidates:
-        if proxy_model_id(item["provider_id"], item["model_id"]) == external_id:
+        if proxy_model_id(item["provider_id"], item["model_id"], provider_map(state)) == external_id:
             return item
     return None
 
@@ -125,18 +177,18 @@ def is_compaction_request(headers: dict[str, str], data: dict[str, Any]) -> bool
     return False
 
 
-def provider_key(provider_id: str) -> str | None:
+def provider_key(provider_id: str, state: dict[str, Any]) -> str | None:
     try:
         credentials = json.loads(CREDENTIALS_PATH.read_text(encoding="utf-8"))
     except (FileNotFoundError, json.JSONDecodeError, OSError):
         return None
-    credential_id = PROVIDERS[provider_id]["credential_id"]
+    credential_id = provider_map(state).get(provider_id, {}).get("credential_id", provider_id)
     value = credentials.get(credential_id) if isinstance(credentials, dict) else None
     return value.strip() if isinstance(value, str) and value.strip() else None
 
 
-def request_headers(provider_id: str, incoming: dict[str, str]) -> dict[str, str]:
-    api_key = provider_key(provider_id)
+def request_headers(provider_id: str, incoming: dict[str, str], state: dict[str, Any]) -> dict[str, str]:
+    api_key = provider_key(provider_id, state)
     if not api_key:
         raise RuntimeError(f"Ключ провайдера {provider_id} не настроен.")
     headers = {
@@ -227,7 +279,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         if self.path.split("?", 1)[0] in ("/status", "/health"):
-            self.send_json({"ok": True, "providers": sorted(set(ALIASES))})
+            self.send_json({"ok": True, "providers": sorted(provider_map(load_state()))})
         else:
             self.send_json({"error": "Not found"}, status=404)
 
@@ -277,9 +329,10 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 status=404,
             )
             return
+        providers = provider_map(state)
         data["model"] = route["model_id"]
-        upstream_url = f"{PROVIDERS[route['provider_id']]['base_url'].rstrip('/')}/responses"
-        self.forward(upstream_url, data, route["provider_id"])
+        upstream_url = f"{providers[route['provider_id']]['base_url'].rstrip('/')}/responses"
+        self.forward(upstream_url, data, route["provider_id"], state)
 
     def handle_compact(self, data: dict[str, Any], state: dict[str, Any]) -> None:
         route = compaction_model(state)
@@ -297,8 +350,9 @@ class ProxyHandler(BaseHTTPRequestHandler):
             "stream": False,
             "max_output_tokens": 4096,
         }
-        upstream_url = f"{PROVIDERS[route['provider_id']]['base_url'].rstrip('/')}/responses"
-        response = self.upstream_response(upstream_url, payload, route["provider_id"])
+        providers = provider_map(state)
+        upstream_url = f"{providers[route['provider_id']]['base_url'].rstrip('/')}/responses"
+        response = self.upstream_response(upstream_url, payload, route["provider_id"], state)
         try:
             body = response.read()
             status = response.status
@@ -331,7 +385,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
             "id": response_id,
             "object": "response",
             "created_at": int(time.time()),
-            "model": proxy_model_id(route["provider_id"], route["model_id"]),
+            "model": proxy_model_id(route["provider_id"], route["model_id"], provider_map(state)),
             "status": "completed",
             "output": [item],
         }
@@ -372,13 +426,13 @@ class ProxyHandler(BaseHTTPRequestHandler):
         self.close_connection = True
 
     def upstream_response(
-        self, url: str, payload: dict[str, Any], provider_id: str
+        self, url: str, payload: dict[str, Any], provider_id: str, state: dict[str, Any]
     ) -> urllib.request.urlopen:  # type: ignore[name-defined]
         encoded = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         request = urllib.request.Request(
             url,
             data=encoded,
-            headers=request_headers(provider_id, self.incoming_headers()),
+            headers=request_headers(provider_id, self.incoming_headers(), state),
             method="POST",
         )
         try:
@@ -387,8 +441,17 @@ class ProxyHandler(BaseHTTPRequestHandler):
             # HTTPError carries the provider's useful error body and headers.
             return error
 
-    def forward(self, url: str, payload: dict[str, Any], provider_id: str) -> None:
-        response = self.upstream_response(url, payload, provider_id)
+    def forward(
+        self,
+        url: str,
+        payload: dict[str, Any],
+        provider_id: str,
+        state: dict[str, Any] | None = None,
+    ) -> None:
+        if state is None:
+            response = self.upstream_response(url, payload, provider_id)
+        else:
+            response = self.upstream_response(url, payload, provider_id, state)
         self.send_response(response.status)
         for name in ("Content-Type", "Content-Length", "Retry-After"):
             value = response.headers.get(name)

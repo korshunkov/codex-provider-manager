@@ -1,7 +1,7 @@
 
 import SwiftUI
 
-struct ModelRow: Identifiable, Decodable, Hashable {
+struct ModelRow: Identifiable, Codable, Hashable {
     private let modelIdentifier: String
     let displayName: String
     let modelDescription: String
@@ -9,6 +9,8 @@ struct ModelRow: Identifiable, Decodable, Hashable {
     let inputPrice: Double?
     let outputPrice: Double?
     let pricesAreEstimated: Bool
+    let metadataStatus: String
+    let loadWarning: String?
     let intelligenceIndex: Double?
     let codingIndex: Double?
     let agenticIndex: Double?
@@ -28,6 +30,8 @@ struct ModelRow: Identifiable, Decodable, Hashable {
         case inputPrice = "input_price_per_million"
         case outputPrice = "output_price_per_million"
         case pricesAreEstimated = "price_is_estimate"
+        case metadataStatus = "metadata_status"
+        case loadWarning = "load_warning"
         case intelligenceIndex = "intelligence_index"
         case codingIndex = "coding_index"
         case agenticIndex = "agentic_index"
@@ -74,6 +78,18 @@ struct ModelRow: Identifiable, Decodable, Hashable {
     }
     var contextText: String { "\(contextWindow / 1000)K" }
 
+    var metadataHelp: String {
+        switch metadataStatus {
+        case "provider":
+            return "Основные данные модели получены от провайдера."
+        case "reference":
+            return "Часть данных получена из однозначного совпадения в OpenRouter. Цена осталась от провайдера."
+        default:
+            let warning = loadWarning.map { " Ошибка загрузки: \($0)" } ?? ""
+            return "Контекст и/или уровни рассуждений не подтверждены. Используются безопасные значения.\(warning)"
+        }
+    }
+
     static func price(_ value: Double?, estimated: Bool = false) -> String {
         guard let value else { return "—" }
         if value == 0 { return "бесплатно" }
@@ -99,6 +115,58 @@ struct ModelTestResponse: Decodable {
     let ok: Bool
     let message: String
     let attempts: Int?
+}
+
+extension RowTestState {
+    var errorMessage: String {
+        if case .error(let message) = self { return message }
+        return ""
+    }
+}
+
+enum RowTestState: Equatable, Codable {
+    case idle
+    case loading
+    case success
+    case error(String)
+}
+
+struct ProviderConfig: Codable, Identifiable, Hashable {
+    let id: String
+    let label: String
+    let baseURL: String
+    let modelsURL: String?
+    let alias: String
+    let builtIn: Bool
+    let hasKey: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case id, label, alias
+        case baseURL = "base_url"
+        case modelsURL = "models_url"
+        case builtIn = "built_in"
+        case hasKey = "has_key"
+    }
+}
+
+struct ProviderSettingsResponse: Decodable {
+    let providers: [ProviderConfig]
+    let autoCompactMode: String
+    let autoCompactPercent: Int
+    let autoCompactTokens: Int
+
+    enum CodingKeys: String, CodingKey {
+        case providers
+        case autoCompactMode = "auto_compact_mode"
+        case autoCompactPercent = "auto_compact_percent"
+        case autoCompactTokens = "auto_compact_tokens"
+    }
+}
+
+struct UICacheFile: Codable {
+    var version = 1
+    var lists: [String: [ModelRow]] = [:]
+    var tests: [String: RowTestState] = [:]
 }
 
 struct ProviderOption: Hashable, Identifiable {
@@ -163,18 +231,14 @@ struct PowerWatchStateResponse: Decodable {
 enum PriceFilter: String, CaseIterable, Identifiable {
     case all
     case selected
-    case withPrice
     case free
-    case withIndex
 
     var id: String { rawValue }
     var title: String {
         switch self {
         case .all: "Все модели"
         case .selected: "Выбранные"
-        case .withPrice: "С ценой"
         case .free: "Бесплатные"
-        case .withIndex: "С индексом"
         }
     }
 }
@@ -196,23 +260,32 @@ final class ModelStore: ObservableObject {
     @Published var powerWatchNetworkMissingSeconds = 0
     @Published var powerWatchStatus = "Защита от сна выключена."
     @Published var isPowerWatchBusy = false
+    @Published var providerSettings: [ProviderConfig] = []
+    @Published var autoCompactMode = "percent"
+    @Published var autoCompactValue = "75"
+    @Published var settingsStatus = ""
+    @Published var isSettingsBusy = false
+    @Published var rowTests: [String: RowTestState] = [:]
+    @Published var keyProviderID: String?
+    @Published var visibleProviderKeys: [String: String] = [:]
 
-    let providers = [
-        ProviderOption(id: "all", name: "Все провайдеры"),
-        ProviderOption(id: "codex-sale", name: "Codex Sale"),
-        ProviderOption(id: "vibecode", name: "VibeCode"),
-        ProviderOption(id: "anymodel", name: "AnyModel"),
-        ProviderOption(id: "a6api", name: "A6 API"),
-        ProviderOption(id: "openrouter-all", name: "OpenRouter — все"),
-        ProviderOption(id: "openrouter", name: "OpenRouter — бесплатные"),
-    ]
+    var providers: [ProviderOption] {
+        [ProviderOption(id: "all", name: "Все провайдеры")] +
+        providerSettings.map { ProviderOption(id: $0.id, name: $0.label) }
+    }
 
-    private let allProviderIDs = [
-        "codex-sale", "vibecode", "anymodel", "a6api", "openrouter-all",
-    ]
+    private var allProviderIDs: [String] {
+        providerSettings.map(\.id)
+    }
 
-    private let cliURL = URL(fileURLWithPath: "/Users/admin/.local/bin/codex-provider")
-    private let powerWatchURL = URL(fileURLWithPath: "/Users/admin/.codex/bin/codex-power-watch")
+    private let cliURL = FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent(".codex/bin/codex-provider")
+    private let uiCacheURL = FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent(".codex/provider-ui-cache.json")
+    var hasCachedList: Bool { !(uiCache.lists[providerID] ?? []).isEmpty }
+    private var uiCache = UICacheFile()
+    private let powerWatchURL = FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent(".codex/bin/codex-power-watch")
 
     func loadProxyState() {
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
@@ -306,6 +379,251 @@ final class ModelStore: ObservableObject {
         }
     }
 
+    func loadProviderSettings(completion: (() -> Void)? = nil) {
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let result = Self.runProcess(self?.cliURL, arguments: ["provider-settings"])
+            DispatchQueue.main.async {
+                guard let self else { return }
+                switch result {
+                case .success(let output):
+                    do {
+                        let settings = try JSONDecoder().decode(ProviderSettingsResponse.self, from: output)
+                        self.providerSettings = settings.providers
+                        self.autoCompactMode = settings.autoCompactMode
+                        self.autoCompactValue = settings.autoCompactMode == "tokens"
+                            ? String(settings.autoCompactTokens)
+                            : String(settings.autoCompactPercent)
+                    } catch {
+                        self.settingsStatus = "Не удалось прочитать настройки: \(error.localizedDescription)"
+                    }
+                case .failure(.message(let error)):
+                    self.settingsStatus = error
+                }
+                completion?()
+            }
+        }
+    }
+
+    func restoreCachedList(for newProviderID: String) {
+        providerID = newProviderID
+        let rows = uiCache.lists[newProviderID] ?? []
+        if rows.isEmpty {
+            self.rows = []
+            status = "Сохранённого списка нет. Загружаю модели…"
+            load()
+        } else {
+            self.rows = rows
+            status = "Показан сохранённый список: \(rows.count) моделей."
+        }
+    }
+
+    func loadProviderKey(_ provider: ProviderConfig) {
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let result = Self.runProcess(self?.cliURL, arguments: ["provider-key-show", provider.id])
+            DispatchQueue.main.async {
+                guard let self else { return }
+                switch result {
+                case .success(let output):
+                    struct KeyResponse: Decodable {
+                        let key: String
+                    }
+                    do {
+                        let decoded = try JSONDecoder().decode(KeyResponse.self, from: output)
+                        self.visibleProviderKeys[provider.id] = decoded.key
+                    } catch {
+                        self.visibleProviderKeys[provider.id] = nil
+                        self.settingsStatus = "Не удалось прочитать ключ: \(error.localizedDescription)"
+                    }
+                case .failure(.message(let error)):
+                    self.visibleProviderKeys[provider.id] = nil
+                    self.settingsStatus = error
+                }
+            }
+        }
+    }
+
+    func saveAutoCompact() {
+        guard !isSettingsBusy else { return }
+        let mode = autoCompactMode
+        guard let value = Int(autoCompactValue), (4096...10_000_000).contains(value) else {
+            settingsStatus = "Введите число: процент 10–100 или токены от 4096."
+            return
+        }
+        isSettingsBusy = true
+        settingsStatus = "Сохраняю уровень автокомпакта…"
+        let arguments = ["set-auto-compact", "--mode", mode, "--value", String(value)]
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let result = Self.runProcess(self?.cliURL, arguments: arguments)
+            DispatchQueue.main.async {
+                guard let self else { return }
+                switch result {
+                case .success:
+                    self.settingsStatus = "Уровень автокомпакта сохранён."
+                    self.applyCatalogConfiguration()
+                case .failure(.message(let error)):
+                    self.isSettingsBusy = false
+                    self.settingsStatus = error
+                }
+            }
+        }
+    }
+
+    func selectCompactionModel(_ row: ModelRow) {
+        compactionModel = selection(for: row)
+        applyCatalogConfiguration()
+    }
+
+    func addProvider(label: String, prefix: String, baseURL: String, modelsURL: String, apiKey: String) {
+        guard !isSettingsBusy else { return }
+        guard !label.trimmingCharacters(in: .whitespaces).isEmpty else {
+            settingsStatus = "Введите название провайдера."
+            return
+        }
+        guard !apiKey.trimmingCharacters(in: .whitespaces).isEmpty else {
+            settingsStatus = "Введите ключ провайдера."
+            return
+        }
+        isSettingsBusy = true
+        settingsStatus = "Проверяю список моделей…"
+        let arguments = [
+            "provider-add", "--label", label, "--prefix", prefix,
+            "--base-url", baseURL, "--models-url", modelsURL, "--api-key-stdin",
+        ]
+        let keyData = apiKey.data(using: .utf8)
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let result = Self.runProcess(self?.cliURL, arguments: arguments, stdin: keyData)
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.isSettingsBusy = false
+                switch result {
+                case .success(let output):
+                    self.settingsStatus = String(data: output, encoding: .utf8) ?? "Провайдер добавлен."
+                    self.loadProviderSettings {
+                        self.load(refresh: true)
+                    }
+                case .failure(.message(let error)):
+                    self.settingsStatus = error
+                }
+            }
+        }
+    }
+
+    func saveProviderKey(provider: ProviderConfig, apiKey: String) {
+        guard !isSettingsBusy, !apiKey.trimmingCharacters(in: .whitespaces).isEmpty else {
+            settingsStatus = "Введите ключ провайдера."
+            return
+        }
+        isSettingsBusy = true
+        settingsStatus = "Сохраняю ключ…"
+        let data = apiKey.data(using: .utf8)
+        let arguments = ["provider-key", provider.id, "--stdin"]
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let result = Self.runProcess(self?.cliURL, arguments: arguments, stdin: data)
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.isSettingsBusy = false
+                switch result {
+                case .success(let output):
+                    self.settingsStatus = String(data: output, encoding: .utf8) ?? "Ключ сохранён."
+                    self.keyProviderID = nil
+                    self.loadProviderSettings()
+                case .failure(.message(let error)):
+                    self.settingsStatus = error
+                }
+            }
+        }
+    }
+
+    func removeProvider(_ provider: ProviderConfig) {
+        guard !isSettingsBusy, !provider.builtIn else { return }
+        isSettingsBusy = true
+        settingsStatus = "Удаляю провайдера…"
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let result = Self.runProcess(self?.cliURL, arguments: ["provider-remove", provider.id])
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.isSettingsBusy = false
+                switch result {
+                case .success(let output):
+                    self.settingsStatus = String(data: output, encoding: .utf8) ?? "Провайдер удалён."
+                    self.loadProviderSettings()
+                case .failure(.message(let error)):
+                    self.settingsStatus = error
+                }
+            }
+        }
+    }
+
+    func restoreUICache() {
+        guard let data = try? Data(contentsOf: uiCacheURL),
+              let cache = try? JSONDecoder().decode(UICacheFile.self, from: data) else {
+            status = "Сохранённого списка нет. Загружаю модели…"
+            return
+        }
+        uiCache = cache
+        let rows = cache.lists[providerID] ?? []
+        if !rows.isEmpty {
+            self.rows = rows
+            status = "Показан сохранённый список: \(rows.count) моделей."
+        }
+        for (key, state) in cache.tests where state != .loading {
+            rowTests[key] = state
+        }
+    }
+
+    private func persistUICache() {
+        uiCache.lists[providerID] = rows
+        uiCache.tests = rowTests.filter { $0.value != .loading }
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        guard let data = try? encoder.encode(uiCache) else { return }
+        let url = uiCacheURL
+        DispatchQueue.global(qos: .utility).async {
+            try? data.write(to: url, options: .atomic)
+        }
+    }
+
+    func testRow(_ row: ModelRow, force: Bool = false) {
+        let rowID = row.id
+        if !force, case .error = rowTests[rowID] {
+            let message = rowTests[rowID]?.errorMessage ?? ""
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(message, forType: .string)
+            status = "Текст ошибки скопирован."
+            return
+        }
+        guard rowTests[rowID] != .loading else { return }
+        let provider = row.providerID ?? providerID
+        rowTests[rowID] = .loading
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let result = Self.runProcess(self?.cliURL, arguments: ["test-model", provider, "--model", row.modelID])
+            DispatchQueue.main.async {
+                guard let self else { return }
+                switch result {
+                case .success(let output):
+                    do {
+                        let decoded = try JSONDecoder().decode(ModelTestResponse.self, from: output)
+                        self.rowTests[rowID] = decoded.ok
+                            ? .success
+                            : .error(decoded.message)
+                        self.persistUICache()
+                    } catch {
+                        self.rowTests[rowID] = .error("Непонятный ответ проверки: \(error.localizedDescription)")
+                        self.persistUICache()
+                    }
+                case .failure(.message(let error)):
+                    self.rowTests[rowID] = .error(error)
+                    self.persistUICache()
+                }
+            }
+        }
+    }
+
+    func clearSelections(keys: Set<String>) {
+        selectedModels.removeAll { keys.contains($0.key) }
+        status = "Галочки сняты у моделей в текущем списке. Нажмите «Включить выбранные»."
+    }
+
     func load(refresh: Bool = false) {
         if providerID == "all" {
             loadAllProviders(refresh: refresh)
@@ -334,6 +652,7 @@ final class ModelStore: ObservableObject {
                         self.currentModel = decoded.currentModel
                         self.selectedRowID = self.rows.first { $0.modelID == decoded.currentModel }?.id
                         self.status = "\(providerName): \(self.rows.count) моделей. Текущая: \(decoded.currentModel)."
+                        self.persistUICache()
                     } catch {
                         self.status = "Не удалось разобрать ответ: \(error.localizedDescription)"
                     }
@@ -385,9 +704,11 @@ final class ModelStore: ObservableObject {
 
                 if failures.isEmpty {
                     self.status = "Все провайдеры: \(self.rows.count) моделей. Выберите строку, чтобы применить её сервис."
+                    self.persistUICache()
                 } else {
                     let names = failures.joined(separator: "; ")
                     self.status = "Все провайдеры: \(self.rows.count) моделей. Не загружены: \(names)."
+                    self.persistUICache()
                 }
             }
         }
@@ -404,6 +725,20 @@ final class ModelStore: ObservableObject {
 
     var selectedRow: ModelRow? {
         rows.first { $0.id == selectedRowID }
+    }
+
+    func proxyPath(for row: ModelRow) -> String {
+        guard let providerID = row.providerID,
+              let provider = providerSettings.first(where: { $0.id == providerID }) else {
+            return "localhost:8765/\(row.modelID)"
+        }
+        let route: String
+        if providerID == "anymodel" && row.modelID.hasPrefix("am/") {
+            route = row.modelID
+        } else {
+            route = "\(provider.alias)/\(row.modelID)"
+        }
+        return "localhost:8765/\(route)"
     }
 
     func selection(for row: ModelRow) -> ProxySelection {
@@ -435,6 +770,57 @@ final class ModelStore: ObservableObject {
         return item.modelID
     }
 
+    private var autoCompactPayload: [String: Any] {
+        let value = Int(autoCompactValue) ?? (autoCompactMode == "tokens" ? 200_000 : 75)
+        return ["mode": autoCompactMode, "value": value]
+    }
+
+    func applyCatalogConfiguration() {
+        guard !isLoading else { return }
+        isLoading = true
+        settingsStatus = "Применяю настройки каталога…"
+        var payload: [String: Any] = [
+            "models": selectedModels.map { ["provider_id": $0.providerID, "model_id": $0.modelID] },
+            "auto_compact": autoCompactPayload,
+        ]
+        if let compactionModel {
+            payload["compaction_model"] = [
+                "provider_id": compactionModel.providerID,
+                "model_id": compactionModel.modelID,
+            ]
+        } else {
+            payload["compaction_model"] = NSNull()
+        }
+        let data: Data
+        do {
+            data = try JSONSerialization.data(withJSONObject: payload)
+        } catch {
+            isLoading = false
+            settingsStatus = "Не удалось создать запрос: \(error.localizedDescription)"
+            return
+        }
+        let arguments = ["proxy", "configure", "--stdin"]
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let result = Self.runProcess(self?.cliURL, arguments: arguments, stdin: data)
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.isLoading = false
+                switch result {
+                case .success(let output):
+                    do {
+                        _ = try JSONDecoder().decode(ProxyApplyResponse.self, from: output)
+                        self.settingsStatus = "Настройки применены."
+                        self.loadProxyState()
+                    } catch {
+                        self.settingsStatus = "Не удалось разобрать ответ прокси: \(error.localizedDescription)"
+                    }
+                case .failure(.message(let error)):
+                    self.settingsStatus = error
+                }
+            }
+        }
+    }
+
     func applySelection() {
         guard !selectedModels.isEmpty else { return }
         isLoading = true
@@ -457,6 +843,7 @@ final class ModelStore: ObservableObject {
                 "model_id": active.modelID,
             ]
         }
+        payload["auto_compact"] = autoCompactPayload
         let data: Data
         do {
             data = try JSONSerialization.data(withJSONObject: payload)
@@ -597,46 +984,26 @@ struct ContentView: View {
     @State private var searchText = ""
     @State private var priceFilter: PriceFilter = .all
     @State private var sortOrder = [KeyPathComparator(\ModelRow.valueSort, order: .reverse)]
-    @State private var showsCompactionPicker = false
-    @State private var compactionSearch = ""
-    @State private var pinnedSelectionKeys: Set<String> = []
+    @State private var showSettings = false
 
-    private var compactionChoices: [ModelRow] {
-        let selected = store.selectedModels
-        let selectedRows = store.rows.filter { row in
-            guard let providerID = row.providerID else { return false }
-            return selected.contains { $0.providerID == providerID && $0.modelID == row.modelID }
-        }
-        return selectedRows.isEmpty ? store.rows : selectedRows
-    }
-
-    private var searchableCompactionChoices: [ModelRow] {
-        let words = compactionSearch.split(separator: " ").map { $0.lowercased() }
-        guard !words.isEmpty else { return compactionChoices }
-        return compactionChoices.filter { row in
-            let haystack = "\(row.displayName) \(row.modelID) \(row.providerName ?? "")".lowercased()
-            return words.allSatisfy { haystack.contains($0) }
-        }
+    private var visibleSelectionKeys: Set<String> {
+        Set(filteredRows.map { "\($0.providerID ?? "single")|\($0.modelID)" })
     }
 
     private var filteredRows: [ModelRow] {
         let words = searchText.split(separator: " ").map { $0.lowercased() }
-        let rows = store.rows.filter { row in
+        return store.rows.filter { row in
             let haystack = "\(row.displayName) \(row.modelID) \(row.modelDescription) \(row.providerName ?? "")".lowercased()
             let matchesText = words.allSatisfy { haystack.contains($0) }
             let matchesFilter: Bool
             switch priceFilter {
             case .all: matchesFilter = true
             case .selected:
-                let selectionKey = "\(row.providerID ?? "single")|\(row.modelID)"
-                matchesFilter = store.isSelected(row) || pinnedSelectionKeys.contains(selectionKey)
-            case .withPrice: matchesFilter = row.inputPrice != nil || row.outputPrice != nil
+                matchesFilter = store.isSelected(row)
             case .free: matchesFilter = row.inputPrice == 0 || row.outputPrice == 0
-            case .withIndex: matchesFilter = row.codexIndex != nil
             }
             return matchesText && matchesFilter
-        }
-        return rows.sorted(using: sortOrder)
+        }.sorted(using: sortOrder)
     }
 
     var body: some View {
@@ -647,21 +1014,17 @@ struct ContentView: View {
                         Text(provider.name).tag(provider.id)
                     }
                 }
-                .frame(maxWidth: 280)
-                .onChange(of: store.providerID) { _, _ in store.load() }
+                .frame(maxWidth: 240)
+                .onChange(of: store.providerID) { _, newValue in
+                    store.restoreCachedList(for: newValue)
+                }
 
                 Picker("", selection: $priceFilter) {
                     ForEach(PriceFilter.allCases) { filter in
                         Text(filter.title).tag(filter)
                     }
                 }
-                .frame(maxWidth: 180)
-                .help("«Выбранные»: после снятия галочки модель остаётся в списке до смены фильтра")
-                .onChange(of: priceFilter) { _, newValue in
-                    if newValue != .selected {
-                        pinnedSelectionKeys.removeAll()
-                    }
-                }
+                .frame(maxWidth: 150)
 
                 TextField("Поиск: GLM, GPT, Claude…", text: $searchText)
                     .textFieldStyle(.roundedBorder)
@@ -680,12 +1043,7 @@ struct ContentView: View {
                         "",
                         isOn: Binding(
                             get: { store.isSelected(row) },
-                            set: { enabled in
-                                if enabled, priceFilter == .selected {
-                                    pinnedSelectionKeys.insert("\(row.providerID ?? "single")|\(row.modelID)")
-                                }
-                                store.setSelection(row, enabled: enabled)
-                            }
+                            set: { enabled in store.setSelection(row, enabled: enabled) }
                         )
                     )
                     .labelsHidden()
@@ -693,59 +1051,71 @@ struct ContentView: View {
                 .width(34)
 
                 TableColumn("Провайдер", value: \.providerNameSort) { row in
-                    Text(row.providerName ?? "—")
-                        .lineLimit(2)
+                    Text(row.providerName ?? "—").lineLimit(2)
                 }
-                .width(min: 130, ideal: 170)
+                .width(min: 120, ideal: 150)
 
                 TableColumn("Модель", value: \.nameSort) { row in
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(row.displayName)
-                            .lineLimit(1)
-                        Text(row.modelID)
+                    HStack(alignment: .top, spacing: 5) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(row.displayName).lineLimit(1)
+                            Text(store.proxyPath(for: row))
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                        }
+                        Image(systemName: metadataIcon(row))
                             .font(.caption)
-                            .foregroundStyle(.secondary)
-                            .lineLimit(1)
+                            .foregroundStyle(metadataColor(row))
+                            .help(row.metadataHelp)
                     }
                 }
-                .width(min: 220, ideal: 320)
+                .width(min: 220, ideal: 310)
 
                 TableColumn("Вход $/M", value: \.inputSort) { row in
-                    Text(row.inputText)
-                        .monospacedDigit()
-                        .help(row.pricesAreEstimated ? "Примерно: средняя цена дешёвой половины каналов A6" : "")
+                    Text(row.inputText).monospacedDigit()
                 }
-                .width(min: 80, ideal: 105)
+                .width(min: 80, ideal: 100)
 
                 TableColumn("Выход $/M", value: \.outputSort) { row in
-                    Text(row.outputText)
-                        .monospacedDigit()
-                        .help(row.pricesAreEstimated ? "Примерно: средняя цена дешёвой половины каналов A6" : "")
+                    Text(row.outputText).monospacedDigit()
                 }
-                .width(min: 80, ideal: 105)
+                .width(min: 80, ideal: 100)
 
                 TableColumn("Индекс Codex", value: \.indexSort) { row in
-                    Text(row.indexText)
-                        .monospacedDigit()
-                        .help("Agentic × 0.5 + Coding × 0.3 + Intelligence × 0.2")
+                    Text(row.indexText).monospacedDigit()
                 }
-                .width(min: 105, ideal: 125)
+                .width(min: 100, ideal: 120)
 
                 TableColumn("Выгодность", value: \.valueSort) { row in
                     Text(row.valueText)
                         .monospacedDigit()
                         .foregroundStyle(row.isTopFree ? .yellow : .primary)
-                        .fontWeight(row.isTopFree || row.valueScore != nil ? .medium : .regular)
-                        .help(row.isTopFree
-                              ? "Бесплатная модель с индексом Codex выше 40"
-                              : "Индекс Codex ÷ условная цена (80% входа, 20% выхода)")
                 }
-                .width(min: 95, ideal: 110)
+                .width(min: 90, ideal: 105)
 
                 TableColumn("Контекст", value: \.contextSort) { row in
                     Text(row.contextText).monospacedDigit()
                 }
-                .width(min: 80, ideal: 95)
+                .width(min: 75, ideal: 90)
+
+                TableColumn("Тест") { row in
+                    rowTestButton(row)
+                }
+                .width(min: 74, ideal: 84)
+            }
+            .overlay(alignment: .topLeading) {
+                Button {
+                    store.clearSelections(keys: visibleSelectionKeys)
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .font(.callout.weight(.medium))
+                }
+                .buttonStyle(.borderless)
+                .padding(.leading, 13)
+                .padding(.top, 8)
+                .help("Снять галочки только у моделей в текущем списке")
             }
             .padding(.horizontal, 8)
 
@@ -756,84 +1126,23 @@ struct ContentView: View {
                 Spacer()
             }
             .padding(.horizontal)
-            .padding(.top, 10)
+            .padding(.top, 8)
 
-            HStack(spacing: 10) {
-                Toggle("Защита от сна", isOn: Binding(
-                    get: { store.powerWatchRunning },
-                    set: { store.setPowerWatch($0) }
-                ))
-                .toggleStyle(.switch)
-                .disabled(store.isPowerWatchBusy)
-                .help("Пока Codex работает, Mac не засыпает. Если сеть недоступна более минуты, Mac уходит в сон.")
-
-                Text(store.powerWatchStatus)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(2)
+            HStack {
+                Button {
+                    showSettings = true
+                } label: {
+                    Label("Настройки", systemImage: "gearshape")
+                }
+                .buttonStyle(.bordered)
+                .padding(.vertical, 6)
 
                 Spacer()
-            }
-            .padding(.horizontal)
-            .padding(.bottom, 4)
 
-            HStack(spacing: 12) {
                 Text("Выбрано: \(store.selectedModels.count)")
                     .fontWeight(.medium)
 
-                Button {
-                    showsCompactionPicker = true
-                } label: {
-                    Label(
-                        "Компакт: \(store.selectionLabel(store.compactionModel))",
-                        systemImage: "arrow.down.circle"
-                    )
-                    .lineLimit(1)
-                }
-                .buttonStyle(.bordered)
-                .popover(isPresented: $showsCompactionPicker, arrowEdge: .top) {
-                    VStack(alignment: .leading, spacing: 0) {
-                        TextField("Поиск модели…", text: $compactionSearch)
-                            .textFieldStyle(.roundedBorder)
-                            .padding(10)
-                        Divider()
-                        List(searchableCompactionChoices) { row in
-                            Button {
-                                store.compactionModel = store.selection(for: row)
-                                showsCompactionPicker = false
-                                compactionSearch = ""
-                            } label: {
-                                VStack(alignment: .leading, spacing: 2) {
-                                    Text(row.displayName).lineLimit(1)
-                                    Text("\(row.providerName ?? "") · \(row.modelID)")
-                                        .font(.caption)
-                                        .foregroundStyle(.secondary)
-                                        .lineLimit(1)
-                                }
-                            }
-                            .buttonStyle(.plain)
-                        }
-                        .listStyle(.plain)
-                    }
-                    .frame(width: 420, height: 360)
-                }
-
-                Spacer()
-
-                Button("Снять галочки", action: store.clearSelection)
-                    .disabled(store.selectedModels.isEmpty || store.isLoading)
-
-                Button("Проверить совместимость") {
-                    store.testCurrentRow()
-                }
-                .disabled(store.selectedRowID == nil || store.isLoading)
-
-                Button("Сделать активной") {
-                    store.selectCurrentRow()
-                }
-                .disabled(store.selectedRowID == nil || store.isLoading)
-
-                Button("Включить выбранные") {
+                Button("Применить и перезапустить Codex") {
                     store.applySelection()
                 }
                 .buttonStyle(.borderedProminent)
@@ -842,17 +1151,318 @@ struct ContentView: View {
             .padding()
             .background(.bar)
         }
-        .frame(minWidth: 1040, minHeight: 620)
+        .frame(minWidth: 1080, minHeight: 640)
+        .sheet(isPresented: $showSettings) {
+            SettingsView(store: store)
+        }
         .task {
+            store.restoreUICache()
             store.loadProxyState()
-            store.load()
+            store.loadProviderSettings {
+                if !store.hasCachedList {
+                    store.load(refresh: true)
+                }
+            }
             while !Task.isCancelled {
                 store.loadPowerWatchState()
                 try? await Task.sleep(nanoseconds: 5_000_000_000)
             }
         }
     }
+
+    @ViewBuilder
+    private func rowTestButton(_ row: ModelRow) -> some View {
+        switch store.rowTests[row.id] {
+        case .loading:
+            ProgressView().controlSize(.small)
+        case .success:
+            Button {
+                store.testRow(row)
+            } label: {
+                Text("OK").frame(maxWidth: 44)
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+            .help("Проверка пройдена. Нажмите, чтобы проверить снова.")
+        case .error(let message):
+            HStack(spacing: 4) {
+                Button {
+                    store.testRow(row)
+                } label: {
+                    Image(systemName: "info.circle.fill")
+                        .foregroundStyle(.red)
+                }
+                .buttonStyle(.borderless)
+                .help("\(message)\nНажмите, чтобы скопировать ошибку.")
+
+                Button {
+                    store.testRow(row, force: true)
+                } label: {
+                    Image(systemName: "arrow.clockwise")
+                }
+                .buttonStyle(.borderless)
+                .help("Повторить проверку.")
+            }
+        default:
+            Button {
+                store.testRow(row)
+            } label: {
+                Text("Тест").frame(maxWidth: 44)
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+        }
+    }
+
+    private func metadataIcon(_ row: ModelRow) -> String {
+        switch row.metadataStatus {
+        case "provider": return "checkmark.circle"
+        case "reference": return "info.circle"
+        default: return "exclamationmark.triangle"
+        }
+    }
+
+    private func metadataColor(_ row: ModelRow) -> Color {
+        switch row.metadataStatus {
+        case "provider": return .secondary
+        case "reference": return .blue
+        default: return .yellow
+        }
+    }
 }
+
+struct SettingsView: View {
+    @Environment(\.dismiss) private var dismiss
+    @ObservedObject var store: ModelStore
+    @State private var compactSearch = ""
+    @State private var showProviderForm = false
+    @State private var providerLabel = ""
+    @State private var providerPrefix = ""
+    @State private var providerURL = ""
+    @State private var providerModelsURL = ""
+    @State private var providerKey = ""
+    @State private var replacementKey = ""
+
+    private var compactChoices: [ModelRow] {
+        let selected = store.selectedModels
+        let selectedRows = store.rows.filter { row in
+            guard let providerID = row.providerID else { return false }
+            return selected.contains { $0.providerID == providerID && $0.modelID == row.modelID }
+        }
+        return selectedRows.isEmpty ? store.rows : selectedRows
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Text("Настройки")
+                .font(.title2.weight(.semibold))
+                .padding(.horizontal, 22)
+                .padding(.top, 20)
+
+            Form {
+                Section("Провайдеры и ключи") {
+                    if store.providerSettings.isEmpty {
+                        Text("Загружаю провайдеров…").foregroundStyle(.secondary)
+                    } else {
+                        ForEach(store.providerSettings) { provider in
+                            VStack(alignment: .leading, spacing: 8) {
+                                HStack(alignment: .firstTextBaseline) {
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        HStack(spacing: 6) {
+                                            Text(provider.label).fontWeight(.medium)
+                                            if provider.builtIn {
+                                                Text("встроенный")
+                                                    .font(.caption2)
+                                                    .padding(.horizontal, 5)
+                                                    .padding(.vertical, 1)
+                                                    .background(.quaternary)
+                                                    .clipShape(Capsule())
+                                            }
+                                            if !provider.hasKey {
+                                                Text("нет ключа")
+                                                    .font(.caption2)
+                                                    .foregroundStyle(.orange)
+                                            }
+                                        }
+                                        Text(provider.baseURL)
+                                            .font(.caption)
+                                            .foregroundStyle(.secondary)
+                                            .lineLimit(1)
+                                    }
+                                    Spacer()
+                                    Button(store.visibleProviderKeys[provider.id] == nil ? "Показать" : "Скрыть") {
+                                        if store.visibleProviderKeys[provider.id] == nil {
+                                            store.loadProviderKey(provider)
+                                        } else {
+                                            store.visibleProviderKeys[provider.id] = nil
+                                        }
+                                    }
+                                    .buttonStyle(.borderless)
+
+                                    Button("Заменить") {
+                                        store.keyProviderID = provider.id
+                                        replacementKey = ""
+                                    }
+                                    .buttonStyle(.borderless)
+
+                                    if !provider.builtIn {
+                                        Button("Удалить") {
+                                            store.removeProvider(provider)
+                                        }
+                                        .buttonStyle(.borderless)
+                                        .foregroundStyle(.red)
+                                    }
+                                }
+
+                                if let key = store.visibleProviderKeys[provider.id] {
+                                    HStack {
+                                        Text(key)
+                                            .font(.system(.caption, design: .monospaced))
+                                            .lineLimit(1)
+                                            .truncationMode(.middle)
+                                        Spacer()
+                                        Button("Копировать") {
+                                            NSPasteboard.general.clearContents()
+                                            NSPasteboard.general.setString(key, forType: .string)
+                                        }
+                                        .buttonStyle(.borderless)
+                                    }
+                                }
+
+                                if store.keyProviderID == provider.id {
+                                    SecureField("Новый ключ", text: $replacementKey)
+                                    HStack {
+                                        Button("Сохранить новый ключ") {
+                                            store.saveProviderKey(provider: provider, apiKey: replacementKey)
+                                            replacementKey = ""
+                                        }
+                                        .disabled(store.isSettingsBusy || replacementKey.isEmpty)
+                                        Button("Отмена") {
+                                            store.keyProviderID = nil
+                                            replacementKey = ""
+                                        }
+                                    }
+                                }
+                            }
+                            .padding(.vertical, 2)
+                        }
+                    }
+                    Divider()
+                    if showProviderForm {
+                        TextField("Название", text: $providerLabel)
+                        TextField("Префикс, например myai", text: $providerPrefix)
+                        TextField("Адрес API, например https://api.example.com/v1", text: $providerURL)
+                        TextField("Адрес списка моделей (необязательно)", text: $providerModelsURL)
+                        SecureField("API-ключ", text: $providerKey)
+                        HStack {
+                            Button("Проверить и добавить") {
+                                store.addProvider(
+                                    label: providerLabel,
+                                    prefix: providerPrefix,
+                                    baseURL: providerURL,
+                                    modelsURL: providerModelsURL,
+                                    apiKey: providerKey
+                                )
+                                providerKey = ""
+                            }
+                            .disabled(store.isSettingsBusy)
+                            Button("Отмена") {
+                                showProviderForm = false
+                            }
+                        }
+                    } else {
+                        Button("Добавить провайдера") {
+                            showProviderForm = true
+                        }
+                    }
+                }
+
+                Section("Автокомпакт") {
+                    Picker("Режим", selection: $store.autoCompactMode) {
+                        Text("Процент").tag("percent")
+                        Text("Токены").tag("tokens")
+                    }
+                    .pickerStyle(.segmented)
+
+                    HStack {
+                        if store.autoCompactMode == "tokens" {
+                            TextField("200000", text: $store.autoCompactValue)
+                            Text("токенов")
+                        } else {
+                            Slider(value: Binding(
+                                get: { Double(Int(store.autoCompactValue) ?? 75) },
+                                set: { store.autoCompactValue = String(Int($0)) }
+                            ), in: 10...100, step: 5)
+                            Text("\(store.autoCompactValue)%")
+                                .monospacedDigit()
+                                .frame(width: 46)
+                        }
+                    }
+
+                    Menu {
+                        ForEach(compactChoices) { row in
+                            Button(row.displayName) {
+                                store.selectCompactionModel(row)
+                            }
+                        }
+                    } label: {
+                        Label("Модель: \(store.selectionLabel(store.compactionModel))", systemImage: "arrow.down.circle")
+                            .lineLimit(1)
+                    }
+
+                    Button("Сохранить и применить") {
+                        store.saveAutoCompact()
+                    }
+                    .disabled(store.isSettingsBusy || store.isLoading)
+                    Text("Процент считается отдельно для каждой модели. Токены задают одну общую границу.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
+                Section("Защита от сна") {
+                    Toggle("Защита от сна", isOn: Binding(
+                        get: { store.powerWatchRunning },
+                        set: { store.setPowerWatch($0) }
+                    ))
+                    .toggleStyle(.switch)
+                    .disabled(store.isPowerWatchBusy)
+                    Text("Нужна для того, чтобы при работе агента и закрытии крышки агент продолжал работу от аккумулятора.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Text(store.powerWatchStatus)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
+                if !store.settingsStatus.isEmpty {
+                    Text(store.settingsStatus)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .formStyle(.grouped)
+            .padding(.horizontal, 14)
+
+            HStack {
+                Spacer()
+                Button("Готово") {
+                    showSettingsDismiss()
+                }
+                .keyboardShortcut(.defaultAction)
+            }
+            .padding()
+        }
+        .frame(width: 680, height: 720)
+        .onAppear {
+            store.loadProviderSettings()
+        }
+    }
+
+    private func showSettingsDismiss() {
+        dismiss()
+    }
+}
+
 
 @main
 struct ProviderModelPickerApp: App {

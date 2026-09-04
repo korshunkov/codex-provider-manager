@@ -1,7 +1,7 @@
 on selectedService()
 	set knownServices to {"codex-sale", "vibecode", "anymodel", "a6api", "openrouter"}
 	try
-		set currentResult to do shell script "/Users/admin/.local/bin/codex-provider current"
+		set currentResult to do shell script "$HOME/.local/bin/codex-provider current"
 		repeat with serviceName in knownServices
 			if currentResult contains ("Текущий сервис: " & serviceName) then return serviceName as text
 		end repeat
@@ -39,7 +39,7 @@ set chosenService to serviceFor(chosenName)
 try
 	set searchDialog to display dialog "Введите часть названия модели, например GLM или GPT." & return & return & "Оставьте поле пустым, чтобы показать избранные, недавние и рекомендуемые модели." with title "Модель Codex" default answer "" buttons {"Отмена", "Найти"} default button "Найти" cancel button "Отмена"
 	set searchText to text returned of searchDialog
-	set modelResult to do shell script "/Users/admin/.local/bin/codex-provider models " & quoted form of chosenService & " --search " & quoted form of searchText & " --format tsv --limit 50"
+	set modelResult to do shell script "$HOME/.local/bin/codex-provider models " & quoted form of chosenService & " --search " & quoted form of searchText & " --format tsv --limit 50"
 	if modelResult is "" then
 		display dialog "Подходящие модели не найдены." with title "Модель Codex" buttons {"Закрыть"} default button "Закрыть" with icon caution
 		return
@@ -70,7 +70,7 @@ try
 	end repeat
 	if chosenModelId is "" then error "Не удалось определить выбранную модель."
 
-	do shell script "/Users/admin/.local/bin/codex-provider use " & quoted form of chosenService & " --model " & quoted form of chosenModelId
+	do shell script "$HOME/.local/bin/codex-provider use " & quoted form of chosenService & " --model " & quoted form of chosenModelId
 	do shell script "/usr/bin/pkill -x ChatGPT >/dev/null 2>&1 || true"
 	delay 3
 	do shell script "/usr/bin/open -a ChatGPT"

@@ -1,5 +1,16 @@
+# macOS
 .DS_Store
+
+# Python
 __pycache__/
 *.py[cod]
-*.tmp
+.pytest_cache/
+
+# Local build products and applications
+dist/
+build/
+
+# Local logs and temporary files
 *.log
+*.tmp
+*.swp

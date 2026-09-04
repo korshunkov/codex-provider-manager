@@ -28,12 +28,61 @@ REASONING_DESCRIPTIONS = {
     "ultra": "Максимальные рассуждения с автоматическим делегированием",
 }
 PROXY_PROVIDER_ALIASES = {
-    "codex-sale": "cx",
     "vibecode": "vc",
     "anymodel": "am",
     "a6api": "a6",
     "openrouter-all": "or",
-    "openrouter": "orf",
+}
+
+DEFAULT_PROVIDERS = {
+    "openrouter-all": {
+        "id": "openrouter-all",
+        "label": "OpenRouter",
+        "base_url": "https://openrouter.ai/api/v1",
+        "models_url": None,
+        "credential_id": "openrouter",
+        "alias": "or",
+        "built_in": True,
+        "model": "z-ai/glm-5.3",
+        "reasoning": "high",
+        "supports_websockets": False
+    },
+    "vibecode": {
+        "id": "vibecode",
+        "label": "VibeCode",
+        "base_url": "https://vibecode.moe/v1",
+        "models_url": None,
+        "credential_id": "vibecode",
+        "alias": "vc",
+        "built_in": False,
+        "model": "gpt-5.6-terra",
+        "reasoning": "high",
+        "supports_websockets": False
+    },
+    "anymodel": {
+        "id": "anymodel",
+        "label": "AnyModel",
+        "base_url": "https://anymodel.org/v1",
+        "models_url": None,
+        "credential_id": "anymodel",
+        "alias": "am",
+        "built_in": False,
+        "model": "gpt-5.6-terra",
+        "reasoning": "high",
+        "supports_websockets": False
+    },
+    "a6api": {
+        "id": "a6api",
+        "label": "A6 API",
+        "base_url": "https://api.a6api.com/v1",
+        "models_url": None,
+        "credential_id": "a6api",
+        "alias": "a6",
+        "built_in": False,
+        "model": "gpt-5.6-terra",
+        "reasoning": "high",
+        "supports_websockets": False
+    },
 }
 ANYMODEL_BASE_PRICE_PER_MILLION = 0.05
 A6_MARKETPLACE_PRICES_URL = "https://a6api.com/api/marketplace/public/channels/search?offset=0&limit=10000"
@@ -71,6 +120,10 @@ def load_state(path: Path) -> dict[str, Any]:
     state.setdefault("last_model", {})
     state.setdefault("selected_models", [])
     state.setdefault("compaction_model", None)
+    state.setdefault("providers", [dict(item) for item in DEFAULT_PROVIDERS.values()])
+    state.setdefault("auto_compact_mode", "percent")
+    state.setdefault("auto_compact_percent", 75)
+    state.setdefault("auto_compact_tokens", 200_000)
     return state
 
 
@@ -98,12 +151,51 @@ def selection_key(provider_id: str, model_id: str) -> str:
     return f"{provider_id}|{model_id}"
 
 
-def proxy_model_id(provider_id: str, model_id: str) -> str:
+def proxy_model_id(
+    provider_id: str,
+    model_id: str,
+    providers: dict[str, dict[str, Any]] | None = None,
+) -> str:
     """Return the stable model name Codex sees through the local proxy."""
+    if providers:
+        alias = str(providers.get(provider_id, {}).get("alias", ""))
+        return f"{alias}/{model_id}" if alias else model_id
     if provider_id == "anymodel" and model_id.startswith("am/"):
         return model_id
     alias = PROXY_PROVIDER_ALIASES.get(provider_id)
     return f"{alias}/{model_id}" if alias else model_id
+
+
+def provider_definitions(state: dict[str, Any] | None = None) -> dict[str, dict[str, Any]]:
+    """Return user gateways plus built-in OpenRouter metadata."""
+    definitions: dict[str, dict[str, Any]] = {}
+    items = state.get("providers") if state else DEFAULT_PROVIDERS.values()
+    if not isinstance(items, list):
+        items = DEFAULT_PROVIDERS.values()
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        provider_id = str(item.get("id", "")).strip()
+        base_url = str(item.get("base_url", "")).strip()
+        alias = str(item.get("alias", "")).strip()
+        if provider_id and base_url.startswith(("http://", "https://")) and alias:
+            models_url = str(item.get("models_url") or "").strip()
+            definitions[provider_id] = {
+                "id": provider_id,
+                "label": str(item.get("label", provider_id)),
+                "base_url": base_url.rstrip("/"),
+                "models_url": models_url or None,
+                "credential_id": str(item.get("credential_id", provider_id)),
+                "alias": alias,
+                "built_in": bool(item.get("built_in", False)),
+            }
+    return definitions
+
+
+def provider_definition(
+    provider_id: str, state: dict[str, Any] | None = None
+) -> dict[str, Any] | None:
+    return provider_definitions(state).get(provider_id)
 
 
 def set_selected_model(
@@ -128,6 +220,31 @@ def set_compaction_model(
         state["compaction_model"] = None
         return
     state["compaction_model"] = {"provider_id": provider_id, "model_id": model_id}
+
+
+def set_auto_compact_settings(
+    state: dict[str, Any], mode: str, value: int
+) -> None:
+    if mode not in ("percent", "tokens"):
+        raise ValueError("Режим автокомпакта должен быть percent или tokens")
+    if mode == "percent":
+        if not 10 <= int(value) <= 100:
+            raise ValueError("Процент автокомпакта должен быть от 10 до 100")
+        state["auto_compact_mode"] = "percent"
+        state["auto_compact_percent"] = int(value)
+    else:
+        if not 4096 <= int(value) <= 10_000_000:
+            raise ValueError("Лимит автокомпакта должен быть от 4096 до 10 000 000 токенов")
+        state["auto_compact_mode"] = "tokens"
+        state["auto_compact_tokens"] = int(value)
+
+
+def auto_compact_percent(context_window: int, state: dict[str, Any]) -> int:
+    mode = str(state.get("auto_compact_mode", "percent"))
+    if mode == "tokens":
+        limit = int(state.get("auto_compact_tokens", 200_000))
+        return max(1, min(100, round(limit * 100 / max(1, context_window))))
+    return max(1, min(100, int(state.get("auto_compact_percent", 75))))
 
 
 def proxy_selections(state: dict[str, Any]) -> list[dict[str, str]]:
@@ -459,7 +576,10 @@ def merge_a6_marketplace_prices(
 def _with_model_fields(model: dict[str, Any], provider_id: str = "") -> dict[str, Any]:
     """Keep model caches created before pricing metadata readable."""
     model = dict(model)
+    had_reasoning_source = "reasoning_levels_source" in model
     model.setdefault("context_window", 128000)
+    model.setdefault("context_window_source", "fallback")
+    model.setdefault("reasoning_levels_source", "fallback")
     model.setdefault("input_price_per_million", None)
     model.setdefault("output_price_per_million", None)
     model.setdefault("intelligence_index", None)
@@ -472,7 +592,7 @@ def _with_model_fields(model: dict[str, Any], provider_id: str = "") -> dict[str
         # A6 previously stored the generic 128K fallback, so let OpenRouter
         # replace it. Other legacy caches already contained provider data.
         model["context_window_source"] = "missing" if provider_id == "a6api" else "provider"
-    if provider_id in ("a6api", "anymodel") and "reasoning_levels_source" not in model:
+    if provider_id in ("a6api", "anymodel") and not had_reasoning_source:
         # Migrate caches created before the source marker was introduced.
         if model.get("reasoning_levels") == ["low", "medium", "high"]:
             model["reasoning_levels"] = ["medium"]
@@ -483,6 +603,13 @@ def _with_model_fields(model: dict[str, Any], provider_id: str = "") -> dict[str
         else:
             model["reasoning_levels_source"] = "provider"
     model.setdefault("reasoning_levels_source", "fallback")
+    context_source = model.get("context_window_source")
+    reasoning_source = model.get("reasoning_levels_source")
+    model["metadata_status"] = (
+        "provider" if context_source == "provider" and reasoning_source == "provider"
+        else "reference" if context_source in ("openrouter", "reference") or reasoning_source in ("openrouter", "reference")
+        else "unconfirmed"
+    )
     return model
 
 
@@ -523,6 +650,9 @@ def normalize_model(provider_id: str, item: dict[str, Any]) -> dict[str, Any] | 
         "reasoning_levels": levels,
         "default_reasoning_level": default_level,
         "reasoning_levels_source": levels_source,
+        "metadata_status": "provider" if context_source == "provider" and levels_source == "provider" else (
+            "reference" if context_source == "openrouter" or levels_source == "openrouter" else "unconfirmed"
+        ),
         "input_price_per_million": input_price,
         "output_price_per_million": output_price,
         "intelligence_index": intelligence_index,
@@ -673,8 +803,6 @@ def fetch_models(
         raise RuntimeError(f"Не удалось загрузить список моделей {provider_id}: {error}") from error
 
     raw_models = payload.get("data", []) if isinstance(payload, dict) else []
-    if provider_id == "openrouter":
-        raw_models = [item for item in raw_models if isinstance(item, dict) and _is_free_openrouter_model(item)]
     normalized = [normalize_model(provider_id, item) for item in raw_models if isinstance(item, dict)]
     models = [item for item in normalized if item is not None]
     models.sort(key=lambda item: (item["display_name"].casefold(), item["id"].casefold()))
@@ -741,9 +869,6 @@ def build_shelf(
         for model in models:
             if term in f"{model['id']} {model['display_name']}".casefold():
                 add(model["id"])
-    if provider_id == "openrouter":
-        for model in models:
-            add(model["id"])
     for model in models:
         add(model["id"])
         if len(ordered_ids) >= SHELF_LIMIT:
@@ -770,6 +895,7 @@ def write_codex_catalog(
     shelf: list[dict[str, Any]],
     codex_binary: Path,
     provider_id: str = "",
+    settings: dict[str, Any] | None = None,
 ) -> None:
     bundled = _bundled_catalog(codex_binary)
     bundled_by_slug = {model.get("slug"): model for model in bundled["models"] if isinstance(model, dict)}
@@ -801,6 +927,9 @@ def write_codex_catalog(
         entry["input_modalities"] = model["input_modalities"]
         entry["context_window"] = model["context_window"]
         entry["max_context_window"] = model["context_window"]
+        entry["effective_context_window_percent"] = auto_compact_percent(
+            model["context_window"], settings or {}
+        )
         # These flags come from the selected provider's model metadata, not
         # from the OpenAI template used to fill unrelated catalog fields.
         supports_search = model.get("supports_search_tool")
