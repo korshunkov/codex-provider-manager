@@ -221,6 +221,46 @@ class CodexProviderProxyTests(unittest.TestCase):
         self.assertTrue(handler.close_connection)
         self.assertTrue(response.closed)
 
+    def test_forward_reports_non_stream_200_as_stream_failure(self):
+        class NonStreamResponse:
+            status = 200
+            headers = Message()
+
+            def __init__(self):
+                self.headers["Content-Type"] = "application/json"
+                self.closed = False
+                self.read_count = 0
+
+            def read(self, _size):
+                self.read_count += 1
+                if self.read_count == 1:
+                    return b'{"type":"response.completed"}'
+                return b""
+
+            def close(self):
+                self.closed = True
+
+        response = NonStreamResponse()
+        handler = object.__new__(codex_provider_proxy.ProxyHandler)
+        handler.wfile = io.BytesIO()
+        handler.close_connection = False
+        handler.send_response = lambda _status: None
+        handler.send_header = lambda *_args: None
+        handler.end_headers = lambda: None
+        handler.upstream_response = lambda _url, _payload, _provider: response
+
+        handler.forward(
+            "https://example.test/responses",
+            {"stream": True},
+            "anymodel",
+        )
+
+        body = handler.wfile.getvalue().decode("utf-8")
+        self.assertIn("event: response.failed", body)
+        self.assertIn("upstream_stream_error", body)
+        self.assertTrue(handler.close_connection)
+        self.assertTrue(response.closed)
+
     def test_stream_terminal_event_may_span_chunks(self):
         pending = bytearray()
         self.assertFalse(
