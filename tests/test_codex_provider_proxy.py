@@ -42,6 +42,48 @@ class CodexProviderProxyTests(unittest.TestCase):
         )
         self.assertIsNone(codex_provider_proxy.model_route(state, "unknown"))
 
+    def test_remote_compaction_v2_is_detected_from_metadata(self):
+        headers = {"x-codex-turn-metadata": '{"request_kind":"compaction"}'}
+        self.assertTrue(codex_provider_proxy.is_compaction_request(headers, {}))
+        self.assertTrue(
+            codex_provider_proxy.is_compaction_request({}, {"request_kind": "compaction"})
+        )
+        self.assertFalse(codex_provider_proxy.is_compaction_request({}, {"model": "a6/kimi-k3"}))
+
+    def test_compaction_stream_has_one_completed_compaction_item(self):
+        handler = object.__new__(codex_provider_proxy.ProxyHandler)
+        handler.wfile = io.BytesIO()
+        handler.close_connection = False
+        sent = []
+        handler.send_response = lambda status: sent.append(("status", status))
+        handler.send_header = lambda name, value: sent.append(("header", name, value))
+        handler.end_headers = lambda: sent.append(("end",))
+
+        response = {
+            "id": "resp_compact_test",
+            "object": "response",
+            "model": "am/kimi-k3",
+            "status": "completed",
+            "output": [],
+        }
+        item = {
+            "id": "item_resp_compact_test",
+            "type": "compaction",
+            "encrypted_content": "ready",
+        }
+        response["output"] = [item]
+        handler.send_compaction_stream(response, item)
+
+        raw = handler.wfile.getvalue().decode("utf-8")
+        self.assertTrue(handler.close_connection)
+        self.assertIn(("status", 200), sent)
+        self.assertIn("event: response.output_item.done", raw)
+        self.assertEqual(raw.count('"type": "compaction"'), 2)
+        completed = json.loads(raw.split("event: response.completed\ndata: ", 1)[1].split("\n\n", 1)[0])
+        self.assertEqual(completed["response"]["status"], "completed")
+        self.assertEqual(len(completed["response"]["output"]), 1)
+        self.assertEqual(completed["response"]["output"][0]["type"], "compaction")
+
     def test_compaction_text_supports_responses_and_chat_completions(self):
         responses_payload = {
             "output": [
@@ -104,6 +146,90 @@ class CodexProviderProxyTests(unittest.TestCase):
         self.assertTrue(handler.close_connection)
         self.assertTrue(response.closed)
         self.assertIn(("status", 200), sent)
+
+    def test_forward_closes_clean_stream_without_terminal_event(self):
+        class StreamWithoutCompletion:
+            status = 200
+            headers = Message()
+
+            def __init__(self):
+                self.headers["Content-Type"] = "text/event-stream"
+                self.closed = False
+                self.read_count = 0
+
+            def read(self, _size):
+                self.read_count += 1
+                if self.read_count == 1:
+                    return b"event: response.created\ndata: {}\n\n"
+                return b""
+
+            def close(self):
+                self.closed = True
+
+        response = StreamWithoutCompletion()
+        handler = object.__new__(codex_provider_proxy.ProxyHandler)
+        handler.wfile = io.BytesIO()
+        handler.close_connection = False
+        handler.send_response = lambda _status: None
+        handler.send_header = lambda *_args: None
+        handler.end_headers = lambda: None
+        handler.upstream_response = lambda _url, _payload, _provider: response
+
+        handler.forward("https://example.test/responses", {}, "anymodel")
+
+        body = handler.wfile.getvalue().decode("utf-8")
+        self.assertIn("event: response.created", body)
+        self.assertIn("event: response.failed", body)
+        self.assertTrue(handler.close_connection)
+        self.assertTrue(response.closed)
+
+    def test_forward_closes_body_without_explicit_length(self):
+        class ChunkedJSONResponse:
+            status = 200
+            headers = Message()
+
+            def __init__(self):
+                self.headers["Content-Type"] = "application/json"
+                self.closed = False
+                self.read_count = 0
+
+            def read(self, _size):
+                self.read_count += 1
+                if self.read_count == 1:
+                    return b'{"type":"response.completed"}'
+                return b""
+
+            def close(self):
+                self.closed = True
+
+        response = ChunkedJSONResponse()
+        handler = object.__new__(codex_provider_proxy.ProxyHandler)
+        handler.wfile = io.BytesIO()
+        handler.close_connection = False
+        sent = []
+        handler.send_response = lambda status: sent.append(("status", status))
+        handler.send_header = lambda name, value: sent.append((name, value))
+        handler.end_headers = lambda: sent.append(("end",))
+        handler.upstream_response = lambda _url, _payload, _provider: response
+
+        handler.forward("https://example.test/responses", {}, "anymodel")
+
+        body = handler.wfile.getvalue().decode("utf-8")
+        self.assertIn('{"type":"response.completed"}', body)
+        self.assertNotIn("event: response.failed", body)
+        self.assertIn(("Connection", "close"), sent)
+        self.assertTrue(handler.close_connection)
+        self.assertTrue(response.closed)
+
+    def test_stream_terminal_event_may_span_chunks(self):
+        pending = bytearray()
+        self.assertFalse(
+            codex_provider_proxy.observe_sse_terminal(b"event: response.comp", pending)
+        )
+        self.assertTrue(
+            codex_provider_proxy.observe_sse_terminal(b"leted\ndata: {}\n\n", pending)
+        )
+        self.assertEqual(pending, bytearray())
 
 
 if __name__ == "__main__":
