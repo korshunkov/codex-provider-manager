@@ -271,6 +271,92 @@ class CodexProviderProxyTests(unittest.TestCase):
         )
         self.assertEqual(pending, bytearray())
 
+    def test_chat_request_is_converted_for_responses_provider(self):
+        request = {
+            "messages": [
+                {"role": "system", "content": "Be brief"},
+                {"role": "user", "content": "ok?"},
+            ],
+            "max_tokens": 17,
+            "stream": True,
+            "tools": [{
+                "type": "function",
+                "function": {"name": "read", "parameters": {"type": "object"}},
+            }],
+        }
+        payload = codex_provider_proxy.upstream_payload(request, "model", "responses", "chat")
+        self.assertEqual(payload["model"], "model")
+        self.assertEqual(payload["instructions"], "Be brief")
+        self.assertEqual(payload["input"][-1]["content"][0]["text"], "ok?")
+        self.assertEqual(payload["max_output_tokens"], 17)
+        self.assertFalse(payload["stream"])
+        self.assertEqual(payload["tools"][0]["name"], "read")
+
+    def test_responses_request_is_converted_for_chat_provider(self):
+        request = {
+            "instructions": "Be brief",
+            "input": [{"role": "user", "content": [{"type": "input_text", "text": "ok?"}]}],
+            "max_output_tokens": 17,
+            "stream": True,
+            "tools": [{"type": "function", "name": "read", "parameters": {"type": "object"}}],
+        }
+        payload = codex_provider_proxy.upstream_payload(request, "model", "chat", "responses")
+        self.assertEqual(payload["model"], "model")
+        self.assertEqual(payload["messages"][0]["role"], "system")
+        self.assertEqual(payload["messages"][-1]["content"], "ok?")
+        self.assertEqual(payload["max_tokens"], 17)
+        self.assertFalse(payload["stream"])
+        self.assertEqual(payload["tools"][0]["function"]["name"], "read")
+
+    def test_responses_result_becomes_chat_completion(self):
+        result = codex_provider_proxy.chat_completion_from_responses(
+            {
+                "output": [
+                    {"type": "message", "content": [{"type": "output_text", "text": "ready"}]},
+                    {
+                        "type": "function_call",
+                        "call_id": "call_1",
+                        "name": "read",
+                        "arguments": "{}",
+                    },
+                ],
+                "usage": {"input_tokens": 3, "output_tokens": 4},
+            },
+            "proxy/model",
+        )
+        message = result["choices"][0]["message"]
+        self.assertEqual(message["content"], "ready")
+        self.assertEqual(message["tool_calls"][0]["id"], "call_1")
+        self.assertEqual(result["choices"][0]["finish_reason"], "tool_calls")
+        self.assertEqual(result["usage"]["prompt_tokens"], 3)
+
+    def test_chat_result_becomes_responses_payload(self):
+        result = codex_provider_proxy.responses_from_chat_completion(
+            {
+                "choices": [{
+                    "message": {"role": "assistant", "content": "ready"},
+                    "finish_reason": "stop",
+                }],
+                "usage": {"prompt_tokens": 3, "completion_tokens": 4},
+            },
+            "proxy/model",
+        )
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["model"], "proxy/model")
+        self.assertEqual(result["output"][0]["content"][0]["text"], "ready")
+        self.assertEqual(result["usage"]["input_tokens"], 3)
+
+    def test_chat_stream_terminal_is_detected(self):
+        pending = bytearray()
+        self.assertFalse(
+            codex_provider_proxy.observe_sse_terminal(
+                b'data: {"choices":[{"delta":{"content":"ok"}}]}\n\n', pending
+            )
+        )
+        self.assertTrue(
+            codex_provider_proxy.observe_sse_terminal(b"data: [DONE]\n\n", pending)
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

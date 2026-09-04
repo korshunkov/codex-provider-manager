@@ -42,6 +42,7 @@ DEFAULT_PROVIDERS = {
         "models_url": None,
         "credential_id": "openrouter",
         "alias": "or",
+        "api_mode": "responses",
         "built_in": True,
         "model": "z-ai/glm-5.3",
         "reasoning": "high",
@@ -54,6 +55,7 @@ DEFAULT_PROVIDERS = {
         "models_url": None,
         "credential_id": "vibecode",
         "alias": "vc",
+        "api_mode": "responses",
         "built_in": False,
         "model": "gpt-5.6-terra",
         "reasoning": "high",
@@ -66,6 +68,7 @@ DEFAULT_PROVIDERS = {
         "models_url": None,
         "credential_id": "anymodel",
         "alias": "am",
+        "api_mode": "responses",
         "built_in": False,
         "model": "gpt-5.6-terra",
         "reasoning": "high",
@@ -78,6 +81,7 @@ DEFAULT_PROVIDERS = {
         "models_url": None,
         "credential_id": "a6api",
         "alias": "a6",
+        "api_mode": "responses",
         "built_in": False,
         "model": "gpt-5.6-terra",
         "reasoning": "high",
@@ -180,11 +184,15 @@ def provider_definitions(state: dict[str, Any] | None = None) -> dict[str, dict[
         alias = str(item.get("alias", "")).strip()
         if provider_id and base_url.startswith(("http://", "https://")) and alias:
             models_url = str(item.get("models_url") or "").strip()
+            api_mode = str(item.get("api_mode", "responses")).strip()
+            if api_mode not in ("responses", "chat"):
+                api_mode = "responses"
             definitions[provider_id] = {
                 "id": provider_id,
                 "label": str(item.get("label", provider_id)),
                 "base_url": base_url.rstrip("/"),
                 "models_url": models_url or None,
+                "api_mode": api_mode,
                 "credential_id": str(item.get("credential_id", provider_id)),
                 "alias": alias,
                 "built_in": bool(item.get("built_in", False)),

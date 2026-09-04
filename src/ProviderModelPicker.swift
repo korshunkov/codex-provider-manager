@@ -240,6 +240,7 @@ struct ProviderConfig: Codable, Identifiable, Hashable {
     let label: String
     let baseURL: String
     let modelsURL: String?
+    let apiMode: String?
     let alias: String
     let builtIn: Bool
     let hasKey: Bool
@@ -248,6 +249,7 @@ struct ProviderConfig: Codable, Identifiable, Hashable {
         case id, label, alias
         case baseURL = "base_url"
         case modelsURL = "models_url"
+        case apiMode = "api_mode"
         case builtIn = "built_in"
         case hasKey = "has_key"
     }
@@ -578,7 +580,7 @@ final class ModelStore: ObservableObject {
         applyCatalogConfiguration()
     }
 
-    func addProvider(label: String, prefix: String, baseURL: String, modelsURL: String, apiKey: String) {
+    func addProvider(label: String, prefix: String, baseURL: String, modelsURL: String, apiMode: String, apiKey: String) {
         guard !isSettingsBusy else { return }
         guard !label.trimmingCharacters(in: .whitespaces).isEmpty else {
             settingsStatus = "Введите название провайдера."
@@ -592,7 +594,8 @@ final class ModelStore: ObservableObject {
         settingsStatus = "Проверяю список моделей…"
         let arguments = [
             "provider-add", "--label", label, "--prefix", prefix,
-            "--base-url", baseURL, "--models-url", modelsURL, "--api-key-stdin",
+            "--base-url", baseURL, "--models-url", modelsURL,
+            "--api-mode", apiMode, "--api-key-stdin",
         ]
         let keyData = apiKey.data(using: .utf8)
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
@@ -1349,6 +1352,7 @@ struct SettingsView: View {
     @State private var providerPrefix = ""
     @State private var providerURL = ""
     @State private var providerModelsURL = ""
+    @State private var providerAPIMode = "responses"
     @State private var providerKey = ""
     @State private var replacementKey = ""
 
@@ -1462,6 +1466,10 @@ struct SettingsView: View {
                         TextField("Префикс, например myai", text: $providerPrefix)
                         TextField("Адрес API, например https://api.example.com/v1", text: $providerURL)
                         TextField("Адрес списка моделей (необязательно)", text: $providerModelsURL)
+                        Picker("Тип API", selection: $providerAPIMode) {
+                            Text("Responses").tag("responses")
+                            Text("Chat Completions").tag("chat")
+                        }
                         SecureField("API-ключ", text: $providerKey)
                         HStack {
                             Button("Проверить и добавить") {
@@ -1470,6 +1478,7 @@ struct SettingsView: View {
                                     prefix: providerPrefix,
                                     baseURL: providerURL,
                                     modelsURL: providerModelsURL,
+                                    apiMode: providerAPIMode,
                                     apiKey: providerKey
                                 )
                                 providerKey = ""

@@ -897,17 +897,30 @@ def _test_streaming_response(
     api_key: str,
     model_id: str,
     reasoning_effort: str,
+    api_mode: str = "responses",
 ) -> str | None:
     """Return an error message, or None after a complete streaming response."""
-    request_body = {
-        "model": model_id,
-        "input": "Ответь ровно одним словом: ok",
-        "max_output_tokens": 16,
-        "stream": True,
-        "reasoning": {"effort": reasoning_effort},
-    }
+    if api_mode == "chat":
+        request_body = {
+            "model": model_id,
+            "messages": [{"role": "user", "content": "Ответь ровно одним словом: ok"}],
+            "max_tokens": 16,
+            "stream": True,
+        }
+        endpoint = "/chat/completions"
+        completed_marker = b"[DONE]"
+    else:
+        request_body = {
+            "model": model_id,
+            "input": "Ответь ровно одним словом: ok",
+            "max_output_tokens": 16,
+            "stream": True,
+            "reasoning": {"effort": reasoning_effort},
+        }
+        endpoint = "/responses"
+        completed_marker = b"response.completed"
     request = urllib.request.Request(
-        f"{base_url.rstrip('/')}/responses",
+        f"{base_url.rstrip('/')}{endpoint}",
         data=json.dumps(request_body).encode("utf-8"),
         headers={
             "Accept": "text/event-stream",
@@ -920,7 +933,7 @@ def _test_streaming_response(
     try:
         with urllib.request.urlopen(request, timeout=45) as response:
             payload = response.read()
-        if b"response.completed" not in payload:
+        if completed_marker not in payload:
             return "Потоковый ответ оборвался до завершения."
         return None
     except urllib.error.HTTPError as error:
@@ -962,6 +975,7 @@ def command_test_model(args: argparse.Namespace) -> None:
             api_key,
             selected["id"],
             reasoning_effort,
+            str(PROVIDERS[provider_id].get("api_mode", "responses")),
         )
         if error:
             errors.append(f"попытка {attempt}: {error}")
@@ -1010,6 +1024,7 @@ def command_provider_settings(_: argparse.Namespace) -> None:
             "label": provider["label"],
             "base_url": provider["base_url"],
             "models_url": provider.get("models_url"),
+            "api_mode": provider.get("api_mode", "responses"),
             "alias": provider["alias"],
             "built_in": provider.get("built_in", False),
             "has_key": bool(credentials.get(str(provider.get("credential_id", provider_id)))),
@@ -1047,6 +1062,7 @@ def command_provider_add(args: argparse.Namespace) -> None:
         "label": label,
         "base_url": base_url,
         "models_url": args.models_url.strip() or None,
+        "api_mode": args.api_mode,
         "credential_id": prefix,
         "alias": prefix,
         "built_in": False,
@@ -1225,6 +1241,7 @@ def build_parser() -> argparse.ArgumentParser:
     provider_add.add_argument("--prefix", required=True)
     provider_add.add_argument("--base-url", required=True)
     provider_add.add_argument("--models-url", default="")
+    provider_add.add_argument("--api-mode", choices=("responses", "chat"), default="responses")
     provider_add.add_argument("--api-key-stdin", action="store_true")
     provider_add.set_defaults(handler=command_provider_add)
     provider_remove = subcommands.add_parser("provider-remove", help="удалить добавленного провайдера")

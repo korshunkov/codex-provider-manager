@@ -22,6 +22,8 @@ tests, and auto-compaction settings.
 - Защита Mac от сна во время активной задачи Codex.
 - Добавление и удаление OpenAI-совместимых провайдеров.
 - Локальный прокси направляет каждую модель своему провайдеру.
+- Подключение сторонних агентов к одному локальному адресу через
+  Responses API или Chat Completions API.
 
 ## Установка
 
@@ -81,6 +83,29 @@ codex-provider proxy status
 codex-provider proxy start
 codex-provider proxy stop
 codex-power-watch status
+```
+
+## Подключение других агентов
+
+Когда прокси включен, сторонний агент может использовать локальный адрес:
+
+```text
+http://127.0.0.1:8765/v1
+```
+
+Прокси отдает выбранные модели через `GET /v1/models`, принимает
+`POST /v1/responses` и `POST /v1/chat/completions`. Имена моделей нужно брать
+из приложения, например `or/z-ai/glm-5.3`. Поле API-ключа у агента можно
+заполнить любым непустым значением: прокси сам подставляет настоящий ключ
+нужного провайдера.
+
+Для нового провайдера выберите тип API: `Responses`, если у сервиса есть
+`/responses`, или `Chat Completions`, если он поддерживает только
+`/chat/completions`. Через командную строку тип задается так:
+
+```bash
+codex-provider provider-add --label "My AI" --prefix myai \
+  --base-url https://api.example.com/v1 --api-mode chat --api-key-stdin
 ```
 
 ## Приватность и ключи
