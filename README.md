@@ -1,11 +1,17 @@
 # Codex Provider Manager
 
-Менеджер моделей и провайдеров для Codex на macOS. Приложение показывает таблицу
-моделей, проверяет их совместимость, выбирает модель компакта и направляет
-запросы через локальный прокси.
+![macOS](https://img.shields.io/badge/macOS-14%2B-black)
+![License](https://img.shields.io/badge/license-MIT-green)
+[![Tests](https://github.com/korshunkov/codex-provider-manager/actions/workflows/tests.yml/badge.svg)](https://github.com/korshunkov/codex-provider-manager/actions/workflows/tests.yml)
 
-OpenRouter — встроенный провайдер и справочник метаданных. Другие
-OpenAI-совместимые сервисы можно добавить в настройках приложения.
+**Codex Provider Manager** is a macOS SwiftUI app and local proxy for managing
+Codex model providers, OpenAI-compatible APIs, model catalogs, compatibility
+tests, and auto-compaction settings.
+
+Приложение показывает таблицу моделей, проверяет их совместимость, выбирает
+модель компакта и направляет запросы через локальный прокси. OpenRouter —
+встроенный провайдер и справочник метаданных. Другие OpenAI-совместимые сервисы
+можно добавлять в настройках приложения.
 
 ## Возможности
 
@@ -22,7 +28,7 @@ OpenAI-совместимые сервисы можно добавить в на
 Нужны macOS 14 или новее, Xcode Command Line Tools и Python 3.11+.
 
 ```bash
-git clone <адрес-репозитория>.git
+git clone https://github.com/korshunkov/codex-provider-manager.git
 cd codex-provider-manager
 ./build_table_app.sh --install
 ```
