@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import http.client
 import json
 import logging
 import os
@@ -299,10 +300,43 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     break
                 self.wfile.write(chunk)
                 self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            logging.warning("Клиент отключился во время ответа.")
+        except (http.client.IncompleteRead, urllib.error.URLError, TimeoutError, OSError) as error:
+            if not is_stream:
+                raise
+            logging.error("Поток провайдера %s оборвался: %s", provider_id, error)
+            self.send_stream_failure()
         finally:
             response.close()
             if is_stream:
                 self.close_connection = True
+
+    def send_stream_failure(self) -> None:
+        """Tell Codex that an already-started upstream SSE stream failed."""
+        payload = {
+            "type": "response.failed",
+            "response": {
+                "id": f"resp_proxy_error_{int(time.time() * 1000)}",
+                "object": "response",
+                "created_at": int(time.time()),
+                "status": "failed",
+                "completed_at": None,
+                "error": {
+                    "code": "upstream_stream_error",
+                    "message": "Поток ответа провайдера оборвался до завершения.",
+                },
+            },
+        }
+        body = (
+            "event: response.failed\n"
+            f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+        ).encode("utf-8")
+        try:
+            self.wfile.write(body)
+            self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            logging.warning("Клиент отключился при передаче ошибки потока.")
 
     def forward_error(self, status: int, body: bytes) -> None:
         self.send_response(status)
