@@ -35,6 +35,8 @@ struct ModelRow: Identifiable, Codable, Hashable {
         case intelligenceIndex = "intelligence_index"
         case codingIndex = "coding_index"
         case agenticIndex = "agentic_index"
+        case providerID
+        case providerName
     }
 
     var nameSort: String { displayName.lowercased() }
@@ -94,6 +96,108 @@ struct ModelRow: Identifiable, Codable, Hashable {
         guard let value else { return "—" }
         if value == 0 { return "бесплатно" }
         return (estimated ? "~" : "") + String(format: "$%.3f", value)
+    }
+
+    init(
+        modelIdentifier: String,
+        displayName: String,
+        modelDescription: String,
+        contextWindow: Int,
+        inputPrice: Double?,
+        outputPrice: Double?,
+        pricesAreEstimated: Bool,
+        metadataStatus: String,
+        loadWarning: String?,
+        intelligenceIndex: Double?,
+        codingIndex: Double?,
+        agenticIndex: Double?,
+        providerID: String? = nil,
+        providerName: String? = nil
+    ) {
+        self.modelIdentifier = modelIdentifier
+        self.displayName = displayName
+        self.modelDescription = modelDescription
+        self.contextWindow = contextWindow
+        self.inputPrice = inputPrice
+        self.outputPrice = outputPrice
+        self.pricesAreEstimated = pricesAreEstimated
+        self.metadataStatus = metadataStatus
+        self.loadWarning = loadWarning
+        self.intelligenceIndex = intelligenceIndex
+        self.codingIndex = codingIndex
+        self.agenticIndex = agenticIndex
+        self.providerID = providerID
+        self.providerName = providerName
+    }
+}
+
+struct CachedModelRow: Codable {
+    let modelID: String
+    let displayName: String
+    let modelDescription: String
+    let contextWindow: Int
+    let inputPrice: Double?
+    let outputPrice: Double?
+    let pricesAreEstimated: Bool
+    let metadataStatus: String
+    let loadWarning: String?
+    let intelligenceIndex: Double?
+    let codingIndex: Double?
+    let agenticIndex: Double?
+    let providerID: String
+    let providerName: String?
+
+    enum CodingKeys: String, CodingKey {
+        case modelID = "model_id"
+        case displayName = "display_name"
+        case modelDescription = "description"
+        case contextWindow = "context_window"
+        case inputPrice = "input_price_per_million"
+        case outputPrice = "output_price_per_million"
+        case pricesAreEstimated = "price_is_estimate"
+        case metadataStatus = "metadata_status"
+        case loadWarning = "load_warning"
+        case intelligenceIndex = "intelligence_index"
+        case codingIndex = "coding_index"
+        case agenticIndex = "agentic_index"
+        case providerID = "provider_id"
+        case providerName = "provider_name"
+    }
+
+    init(row: ModelRow) {
+        modelID = row.modelID
+        displayName = row.displayName
+        modelDescription = row.modelDescription
+        contextWindow = row.contextWindow
+        inputPrice = row.inputPrice
+        outputPrice = row.outputPrice
+        pricesAreEstimated = row.pricesAreEstimated
+        metadataStatus = row.metadataStatus
+        loadWarning = row.loadWarning
+        intelligenceIndex = row.intelligenceIndex
+        codingIndex = row.codingIndex
+        agenticIndex = row.agenticIndex
+        providerID = row.providerID ?? "single"
+        providerName = row.providerName
+    }
+
+    var modelRow: ModelRow {
+        ModelRow(
+            modelIdentifier: modelID,
+            displayName: displayName,
+            modelDescription: modelDescription,
+            contextWindow: contextWindow,
+            inputPrice: inputPrice,
+            outputPrice: outputPrice,
+            pricesAreEstimated: pricesAreEstimated,
+            metadataStatus: metadataStatus,
+            loadWarning: loadWarning,
+            intelligenceIndex: intelligenceIndex,
+            codingIndex: codingIndex,
+            agenticIndex: agenticIndex,
+            providerID: providerID,
+            providerName: providerName
+        )
     }
 }
 
@@ -164,8 +268,8 @@ struct ProviderSettingsResponse: Decodable {
 }
 
 struct UICacheFile: Codable {
-    var version = 1
-    var lists: [String: [ModelRow]] = [:]
+    var version = 2
+    var lists: [String: [CachedModelRow]] = [:]
     var tests: [String: RowTestState] = [:]
 }
 
@@ -406,15 +510,16 @@ final class ModelStore: ObservableObject {
 
     func restoreCachedList(for newProviderID: String) {
         providerID = newProviderID
-        let rows = uiCache.lists[newProviderID] ?? []
-        if rows.isEmpty {
+        let cachedRows = uiCache.lists[newProviderID] ?? []
+        guard !cachedRows.isEmpty else {
             self.rows = []
+            uiCache.lists[newProviderID] = nil
             status = "Сохранённого списка нет. Загружаю модели…"
             load()
-        } else {
-            self.rows = rows
-            status = "Показан сохранённый список: \(rows.count) моделей."
+            return
         }
+        self.rows = cachedRows.map(\.modelRow)
+        status = "Показан сохранённый список: \(rows.count) моделей."
     }
 
     func loadProviderKey(_ provider: ProviderConfig) {
@@ -561,18 +666,22 @@ final class ModelStore: ObservableObject {
             return
         }
         uiCache = cache
-        let rows = cache.lists[providerID] ?? []
-        if !rows.isEmpty {
-            self.rows = rows
-            status = "Показан сохранённый список: \(rows.count) моделей."
+        let cachedRows = cache.lists[providerID] ?? []
+        guard !cachedRows.isEmpty else {
+            uiCache.lists[providerID] = nil
+            status = "Сохранённого списка нет. Загружаю модели…"
+            return
         }
+        let rows = cachedRows.map(\.modelRow)
+        self.rows = rows
+        status = "Показан сохранённый список: \(rows.count) моделей."
         for (key, state) in cache.tests where state != .loading {
             rowTests[key] = state
         }
     }
 
     private func persistUICache() {
-        uiCache.lists[providerID] = rows
+        uiCache.lists[providerID] = rows.map(CachedModelRow.init)
         uiCache.tests = rowTests.filter { $0.value != .loading }
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys]
