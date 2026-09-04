@@ -61,6 +61,7 @@ PROXY_SCRIPT_PATH = CODEX_HOME / "bin" / "codex-provider-proxy"
 PROXY_PID_PATH = CODEX_HOME / "provider-proxy.pid"
 PROXY_LOG_PATH = CODEX_HOME / "provider-proxy.log"
 PROXY_BASE_URL = "http://127.0.0.1:8765/v1"
+ZCODE_CONFIG_PATH = Path.home() / ".zcode" / "v2" / "config.json"
 PROXY_TARGET_ID = "__proxy__"
 CODEX_BINARY = Path(os.environ.get("CODEX_CLI_PATH", "/Applications/ChatGPT.app/Contents/Resources/codex"))
 DISPLAY_NAME = "OpenAI"
@@ -70,6 +71,144 @@ SESSION_PROVIDER_ID = "codex-sale"
 COMPATIBILITY_TEST_ATTEMPTS = 1
 
 PROVIDERS = DEFAULT_PROVIDERS
+
+
+def _zcode_model_entry(
+    model: dict | None,
+    previous_entry: dict | None,
+) -> dict:
+    """Build the small model record ZCode stores for custom providers."""
+    context_window = int(model.get("context_window") if model else 0) or 128_000
+    input_modalities = model.get("input_modalities") if model else None
+    previous = previous_entry if isinstance(previous_entry, dict) else {}
+    previous_limit = previous.get("limit") if isinstance(previous.get("limit"), dict) else {}
+    entry = dict(previous)
+    entry["limit"] = {
+        "context": context_window,
+        "output": int(previous_limit.get("output") or min(context_window, 131_072)),
+    }
+    entry["modalities"] = {
+        "input": input_modalities if isinstance(input_modalities, list) and input_modalities else ["text"],
+        "output": ["text"],
+    }
+    zcode_meta = dict(previous.get("zcode") or {})
+    zcode_meta["modalitiesConfigured"] = True
+    zcode_meta["modified"] = True
+    entry["zcode"] = zcode_meta
+    return entry
+
+
+def upsert_zcode_provider(
+    config: dict,
+    selections: list[dict[str, str]],
+    models_by_provider: dict[str, dict[str, dict]],
+    provider_names: dict[str, str],
+) -> tuple[dict, str]:
+    """Create or replace one ZCode provider managed by this proxy."""
+    providers = config.setdefault("provider", {})
+    if not isinstance(providers, dict):
+        raise RuntimeError("Файл настроек ZCode повреждён: поле provider не объект.")
+
+    provider_key = next(
+        (
+            key
+            for key, value in providers.items()
+            if isinstance(value, dict)
+            and isinstance(value.get("options"), dict)
+            and value["options"].get("baseURL") == PROXY_BASE_URL
+        ),
+        None,
+    )
+    if provider_key is None:
+        provider_key = "codex-provider-manager"
+        provider = {}
+    else:
+        provider = providers[provider_key]
+        if not isinstance(provider, dict):
+            raise RuntimeError("Запись провайдера ZCode повреждена.")
+
+    old_models = provider.get("models") if isinstance(provider.get("models"), dict) else {}
+    models: dict[str, dict] = {}
+    for item in selections:
+        provider_id = item["provider_id"]
+        model_id = item["model_id"]
+        external_id = item["proxy_id"]
+        models[external_id] = _zcode_model_entry(
+            models_by_provider.get(provider_id, {}).get(model_id),
+            old_models.get(external_id),
+        )
+
+    options = dict(provider.get("options") or {})
+    options["apiKey"] = str(options.get("apiKey") or "local")
+    options["baseURL"] = PROXY_BASE_URL
+    options["apiKeyRequired"] = True
+    provider.update(
+        {
+            "name": str(provider.get("name") or "Codex Provider"),
+            "kind": "openai",
+            "options": options,
+            "source": "custom",
+            "models": models,
+        }
+    )
+    providers[provider_key] = provider
+    # Make names available to the caller without changing the config schema.
+    provider_names[provider_key] = str(provider["name"])
+    return config, provider_key
+
+
+def configure_zcode_provider(state: dict) -> tuple[str, list[str]]:
+    selections = proxy_entries(state)
+    if not selections:
+        raise RuntimeError("Нет выбранных моделей для ZCode.")
+
+    models_by_provider: dict[str, dict[str, dict]] = {}
+    for item in selections:
+        provider_id = item["provider_id"]
+        if provider_id not in models_by_provider:
+            models = available_models(provider_id)
+            models_by_provider[provider_id] = {model["id"]: model for model in models}
+
+    if not ZCODE_CONFIG_PATH.exists():
+        config: dict = {}
+    else:
+        try:
+            config = json.loads(ZCODE_CONFIG_PATH.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError) as error:
+            raise RuntimeError(f"Не удалось прочитать настройки ZCode: {error}") from error
+    if not isinstance(config, dict):
+        raise RuntimeError("Файл настроек ZCode повреждён.")
+
+    provider_names: dict[str, str] = {}
+    config, provider_key = upsert_zcode_provider(
+        config, selections, models_by_provider, provider_names
+    )
+
+    try:
+        mode = ZCODE_CONFIG_PATH.stat().st_mode & 0o777
+    except FileNotFoundError:
+        mode = 0o600
+    backup_directory = ZCODE_CONFIG_PATH.parent / "backups"
+    backup_directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+    backup_path = backup_directory / f"config-before-codex-provider-{stamp}.json"
+    if ZCODE_CONFIG_PATH.exists():
+        shutil.copy2(ZCODE_CONFIG_PATH, backup_path)
+
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix="config.json.", dir=ZCODE_CONFIG_PATH.parent
+    )
+    temporary_path = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as output:
+            json.dump(config, output, ensure_ascii=False, indent=2)
+            output.write("\n")
+        os.chmod(temporary_path, mode)
+        os.replace(temporary_path, ZCODE_CONFIG_PATH)
+    finally:
+        if temporary_path.exists():
+            temporary_path.unlink()
+    return provider_key, [item["proxy_id"] for item in selections]
 
 def toml_string(value: str) -> str:
     return json.dumps(value, ensure_ascii=False)
@@ -670,6 +809,74 @@ def command_proxy_configure(_: argparse.Namespace) -> None:
     )
 
 
+def command_zcode_configure(args: argparse.Namespace) -> None:
+    try:
+        payload = json.load(sys.stdin)
+    except json.JSONDecodeError as error:
+        raise SystemExit(f"Не удалось прочитать JSON выбора: {error}")
+    if not isinstance(payload, dict) or not isinstance(payload.get("models"), list):
+        raise SystemExit("Ожидался JSON с массивом models.")
+
+    state = load_state(MODEL_STATE_PATH)
+    selections = []
+    for item in payload["models"]:
+        if not isinstance(item, dict):
+            continue
+        provider_id = str(item.get("provider_id", ""))
+        model_id = str(item.get("model_id", ""))
+        if provider_id and model_id:
+            selections.append({"provider_id": provider_id, "model_id": model_id})
+
+    compaction = ...
+    if "compaction_model" in payload:
+        value = payload["compaction_model"]
+        compaction = (
+            {
+                "provider_id": str(value.get("provider_id", "")),
+                "model_id": str(value.get("model_id", "")),
+            }
+            if isinstance(value, dict)
+            else None
+        )
+    active = payload.get("active_model")
+    active = (
+        {
+            "provider_id": str(active.get("provider_id", "")),
+            "model_id": str(active.get("model_id", "")),
+        }
+        if isinstance(active, dict)
+        else None
+    )
+    if isinstance(payload.get("auto_compact"), dict):
+        compact = payload["auto_compact"]
+        try:
+            set_auto_compact_settings(
+                state, str(compact.get("mode", "percent")), int(compact.get("value", 75))
+            )
+        except (TypeError, ValueError) as error:
+            raise SystemExit(str(error))
+
+    warnings, active_proxy_id = apply_proxy_configuration(
+        state, selections, active=active, compaction=compaction
+    )
+    try:
+        provider_key, models = configure_zcode_provider(state)
+    except (RuntimeError, OSError) as error:
+        raise SystemExit(f"Не удалось обновить ZCode: {error}")
+    print(
+        json.dumps(
+            {
+                "ok": True,
+                "provider_id": provider_key,
+                "active_model": active_proxy_id,
+                "models": models,
+                "warnings": warnings,
+            },
+            ensure_ascii=False,
+        )
+    )
+
+
 def command_proxy_select(args: argparse.Namespace) -> None:
     models = available_models(args.provider, force=args.refresh)
     model = find_model(models, args.model)
@@ -1233,6 +1440,12 @@ def build_parser() -> argparse.ArgumentParser:
     proxy_start.set_defaults(handler=command_proxy_start)
     proxy_stop = proxy_subcommands.add_parser("stop", help="остановить прокси")
     proxy_stop.set_defaults(handler=command_proxy_stop)
+
+    zcode_configure = subcommands.add_parser(
+        "zcode-configure", help="заменить список моделей провайдера в ZCode"
+    )
+    zcode_configure.add_argument("--stdin", action="store_true")
+    zcode_configure.set_defaults(handler=command_zcode_configure)
 
     provider_settings = subcommands.add_parser("provider-settings", help="показать настройки провайдеров в JSON")
     provider_settings.set_defaults(handler=command_provider_settings)

@@ -314,6 +314,16 @@ struct ProxyApplyResponse: Decodable {
     }
 }
 
+struct ZCodeApplyResponse: Decodable {
+    let providerID: String
+    let models: [String]
+
+    enum CodingKeys: String, CodingKey {
+        case providerID = "provider_id"
+        case models
+    }
+}
+
 struct PowerWatchStateResponse: Decodable {
     let running: Bool
     let codexActive: Bool
@@ -1015,6 +1025,55 @@ final class ModelStore: ObservableObject {
         }
     }
 
+    func configureZCode() {
+        guard !selectedModels.isEmpty, !isLoading else { return }
+        isLoading = true
+        status = "Обновляю список моделей в ZCode…"
+        let active = selectedRow.flatMap { selection(for: $0) }
+        var payload: [String: Any] = [
+            "models": selectedModels.map { ["provider_id": $0.providerID, "model_id": $0.modelID] },
+        ]
+        payload["compaction_model"] = compactionModel.map { selection in
+            ["provider_id": selection.providerID, "model_id": selection.modelID]
+        } ?? NSNull()
+        if let active {
+            payload["active_model"] = [
+                "provider_id": active.providerID,
+                "model_id": active.modelID,
+            ]
+        }
+        payload["auto_compact"] = autoCompactPayload
+
+        let data: Data
+        do {
+            data = try JSONSerialization.data(withJSONObject: payload)
+        } catch {
+            isLoading = false
+            status = "Не удалось создать запрос для ZCode: \(error.localizedDescription)"
+            return
+        }
+
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let result = Self.runProcess(self?.cliURL, arguments: ["zcode-configure", "--stdin"], stdin: data)
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.isLoading = false
+                switch result {
+                case .success(let output):
+                    do {
+                        let decoded = try JSONDecoder().decode(ZCodeApplyResponse.self, from: output)
+                        self.status = "ZCode обновлён: \(decoded.models.count) моделей. Перезапустите ZCode, если он открыт."
+                        self.loadProxyState()
+                    } catch {
+                        self.status = "Не удалось разобрать ответ ZCode: \(error.localizedDescription)"
+                    }
+                case .failure(.message(let error)):
+                    self.status = error
+                }
+            }
+        }
+    }
+
     func testCurrentRow() {
         guard let row = selectedRow else { return }
         isLoading = true
@@ -1248,6 +1307,16 @@ struct ContentView: View {
                 }
                 .buttonStyle(.bordered)
                 .padding(.vertical, 6)
+
+                Button {
+                    store.configureZCode()
+                } label: {
+                    Label("Добавить в ZCode", systemImage: "square.and.arrow.down")
+                }
+                .buttonStyle(.bordered)
+                .padding(.vertical, 6)
+                .disabled(store.selectedModels.isEmpty || store.isLoading)
+                .help("Создать или обновить провайдера ZCode из всех отмеченных моделей")
 
                 Spacer()
 
