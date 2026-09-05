@@ -75,6 +75,11 @@ DEFAULT_PROVIDER_MAP = {
 }
 
 
+def error_payload(message: str) -> dict[str, Any]:
+    """OpenAI-style error body; Codex reads only error.message."""
+    return {"error": {"message": message}}
+
+
 def provider_map(state: dict[str, Any]) -> dict[str, dict[str, Any]]:
     providers = dict(DEFAULT_PROVIDER_MAP)
     records = state.get("providers", [])
@@ -622,14 +627,14 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 })
             self.send_json({"object": "list", "data": records})
         else:
-            self.send_json({"error": "Not found"}, status=404)
+            self.send_json(error_payload("Not found"), status=404)
 
     def do_POST(self) -> None:
         path = self.path.split("?", 1)[0]
         responses_paths = ("/responses", "/v1/responses", "/responses/compact", "/v1/responses/compact")
         chat_paths = ("/chat/completions", "/v1/chat/completions")
         if path not in responses_paths + chat_paths:
-            self.send_json({"error": f"Endpoint {path} не поддерживается."}, status=404)
+            self.send_json(error_payload(f"Endpoint {path} не поддерживается."), status=404)
             return
 
         try:
@@ -639,7 +644,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
             if not isinstance(data, dict):
                 raise ValueError("Тело запроса должно быть JSON-объектом.")
         except (ValueError, json.JSONDecodeError, UnicodeDecodeError) as error:
-            self.send_json({"error": f"Некорректный запрос: {error}"}, status=400)
+            self.send_json(error_payload(f"Некорректный запрос: {error}"), status=400)
             return
 
         state = load_state()
@@ -654,10 +659,10 @@ class ProxyHandler(BaseHTTPRequestHandler):
             logging.warning("Клиент отключился во время ответа.")
         except (RuntimeError, urllib.error.URLError, TimeoutError, OSError) as error:
             logging.error("Запрос не выполнен: %s", error)
-            self.send_json({"error": str(error)}, status=502)
+            self.send_json(error_payload(str(error)), status=502)
         except Exception as error:
             logging.exception("Внутренняя ошибка прокси")
-            self.send_json({"error": f"Внутренняя ошибка: {error}"}, status=500)
+            self.send_json(error_payload(f"Внутренняя ошибка: {error}"), status=500)
 
     def incoming_headers(self) -> dict[str, str]:
         return {name.lower(): value for name, value in self.headers.items()}
@@ -670,7 +675,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
         route = model_route(state, external_id)
         if route is None:
             self.send_json(
-                {"error": f"Модель {external_id or '(не задана)'} не включена в прокси."},
+                error_payload(f"Модель {external_id or '(не задана)'} не включена в прокси."),
                 status=404,
             )
             return
@@ -697,7 +702,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
         route = model_route(state, external_id)
         if route is None:
             self.send_json(
-                {"error": f"Модель {external_id or '(не задана)'} не включена в прокси."},
+                error_payload(f"Модель {external_id or '(не задана)'} не включена в прокси."),
                 status=404,
             )
             return
@@ -722,7 +727,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
     def handle_compact(self, data: dict[str, Any], state: dict[str, Any]) -> None:
         route = compaction_model(state)
         if route is None:
-            self.send_json({"error": "Модель для компакта не выбрана."}, status=409)
+            self.send_json(error_payload("Модель для компакта не выбрана."), status=409)
             return
 
         payload = {
@@ -749,11 +754,11 @@ class ProxyHandler(BaseHTTPRequestHandler):
         try:
             result = json.loads(body.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError) as error:
-            self.send_json({"error": f"Провайдер вернул не JSON: {error}"}, status=502)
+            self.send_json(error_payload(f"Провайдер вернул не JSON: {error}"), status=502)
             return
         text = response_text(result if isinstance(result, dict) else {})
         if not text:
-            self.send_json({"error": "Провайдер не вернул текст для компакта."}, status=502)
+            self.send_json(error_payload("Провайдер не вернул текст для компакта."), status=502)
             return
         logging.info(
             "Компакт направлен: %s/%s",
@@ -834,10 +839,10 @@ class ProxyHandler(BaseHTTPRequestHandler):
         try:
             source = json.loads(body.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError) as error:
-            self.send_json({"error": f"Провайдер вернул не JSON: {error}"}, status=502)
+            self.send_json(error_payload(f"Провайдер вернул не JSON: {error}"), status=502)
             return
         if not isinstance(source, dict):
-            self.send_json({"error": "Провайдер вернул неожиданный ответ."}, status=502)
+            self.send_json(error_payload("Провайдер вернул неожиданный ответ."), status=502)
             return
 
         if inbound_mode == "responses":
