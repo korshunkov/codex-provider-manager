@@ -61,6 +61,8 @@ PROXY_SCRIPT_PATH = CODEX_HOME / "bin" / "codex-provider-proxy"
 PROXY_PID_PATH = CODEX_HOME / "provider-proxy.pid"
 PROXY_LOG_PATH = CODEX_HOME / "provider-proxy.log"
 PROXY_BASE_URL = "http://127.0.0.1:8765/v1"
+PROXY_PORT = 8765
+PROXY_SCRIPT_NAME = "codex-provider-proxy"
 ZCODE_CONFIG_PATH = Path.home() / ".zcode" / "v2" / "config.json"
 PROXY_TARGET_ID = "__proxy__"
 CODEX_BINARY = Path(os.environ.get("CODEX_CLI_PATH", "/Applications/ChatGPT.app/Contents/Resources/codex"))
@@ -683,11 +685,71 @@ def apply_proxy_configuration(
     return warnings, active_proxy_id
 
 
-def proxy_process_pid() -> int | None:
+def pid_belongs_to_proxy(pid: int) -> bool:
+    """Проверить по ps, что процесс с этим PID — действительно наш прокси.
+
+    Порт может занять посторонний процесс, поэтому в командной строке
+    должно упоминаться имя codex-provider-proxy.
+    """
     try:
-        return int(PROXY_PID_PATH.read_text(encoding="ascii").strip())
+        result = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "command="],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return PROXY_SCRIPT_NAME in result.stdout
+
+
+def discover_proxy_pid() -> int | None:
+    """Найти PID процесса, слушающего порт прокси."""
+    try:
+        output = subprocess.run(
+            ["lsof", "-nP", "-t", f"-iTCP:{PROXY_PORT}", "-sTCP:LISTEN"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    for line in output.split():
+        try:
+            pid = int(line)
+        except ValueError:
+            continue
+        if pid_belongs_to_proxy(pid):
+            return pid
+    return None
+
+
+def proxy_file_pid() -> int | None:
+    """PID из файла, если файл цел и указывает на живой процесс прокси."""
+    try:
+        pid = int(PROXY_PID_PATH.read_text(encoding="ascii").strip())
     except (FileNotFoundError, ValueError, OSError):
         return None
+    return pid if pid_belongs_to_proxy(pid) else None
+
+
+def proxy_process_pid() -> int | None:
+    """PID процесса прокси: из PID-файла или найденный по порту.
+
+    Если файл отсутствует или устарел, процесс ищется по слушающему порту,
+    а найденный PID записывается обратно в файл.
+    """
+    pid = proxy_file_pid()
+    if pid is None:
+        pid = discover_proxy_pid()
+        if pid is not None:
+            try:
+                PROXY_PID_PATH.write_text(f"{pid}\n", encoding="ascii")
+            except OSError:
+                pass
+    return pid
 
 
 def proxy_is_running() -> bool:
@@ -701,19 +763,39 @@ def proxy_is_running() -> bool:
         return False
 
 
+def terminate_proxy_process(pid: int) -> None:
+    """Остановить процесс: сначала SIGTERM, затем, если не помог, SIGKILL."""
+    try:
+        os.kill(pid, signal.SIGTERM)
+        for _ in range(30):
+            os.kill(pid, 0)
+            time.sleep(0.1)
+    except (ProcessLookupError, PermissionError):
+        return
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
+
+
 def start_proxy() -> bool:
-    if proxy_is_running():
+    if proxy_file_pid() is not None:
         return False
+    # PID-файл может отсутствовать или быть устаревшим, а порт держать старый
+    # процесс прокси. Остановим его, чтобы запустить актуальную версию скрипта.
+    orphan_pid = discover_proxy_pid()
+    if orphan_pid is not None:
+        terminate_proxy_process(orphan_pid)
     script = PROXY_SCRIPT_PATH
     if not script.exists():
-        script = Path(__file__).with_name("codex-provider-proxy")
+        script = Path(__file__).with_name(PROXY_SCRIPT_NAME)
     if not script.exists():
         raise SystemExit(f"Не найден скрипт прокси: {script}")
 
     PROXY_LOG_PATH.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     with PROXY_LOG_PATH.open("ab") as log:
         process = subprocess.Popen(
-            [sys.executable, str(script), "--port", "8765"],
+            [sys.executable, str(script), "--port", str(PROXY_PORT)],
             stdin=subprocess.DEVNULL,
             stdout=log,
             stderr=subprocess.STDOUT,
@@ -722,7 +804,9 @@ def start_proxy() -> bool:
     PROXY_PID_PATH.write_text(f"{process.pid}\n", encoding="ascii")
     for _ in range(30):
         try:
-            with urllib.request.urlopen("http://127.0.0.1:8765/status", timeout=0.2) as response:
+            with urllib.request.urlopen(
+                f"http://127.0.0.1:{PROXY_PORT}/status", timeout=0.2
+            ) as response:
                 if response.status == 200:
                     return True
         except (urllib.error.URLError, TimeoutError, OSError):
@@ -736,13 +820,7 @@ def stop_proxy() -> bool:
         PROXY_PID_PATH.unlink(missing_ok=True)
         return False
     assert pid is not None
-    os.kill(pid, signal.SIGTERM)
-    for _ in range(30):
-        if not proxy_is_running():
-            break
-        time.sleep(0.1)
-    if proxy_is_running():
-        os.kill(pid, signal.SIGKILL)
+    terminate_proxy_process(pid)
     PROXY_PID_PATH.unlink(missing_ok=True)
     return True
 
