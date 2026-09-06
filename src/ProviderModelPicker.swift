@@ -849,18 +849,23 @@ final class ModelStore: ObservableObject {
         rows.first { $0.id == selectedRowID }
     }
 
-    func proxyPath(for row: ModelRow) -> String {
+    /// Путь модели на локальном прокси без хоста и порта, например `or/gpt-5.2`.
+    func proxyRoute(for row: ModelRow) -> String {
         guard let providerID = row.providerID,
               let provider = providerSettings.first(where: { $0.id == providerID }) else {
-            return "localhost:8765/\(row.modelID)"
+            return row.modelID
         }
-        let route: String
         if providerID == "anymodel" && row.modelID.hasPrefix("am/") {
-            route = row.modelID
-        } else {
-            route = "\(provider.alias)/\(row.modelID)"
+            return row.modelID
         }
-        return "localhost:8765/\(route)"
+        return "\(provider.alias)/\(row.modelID)"
+    }
+
+    func copyProxyRoute(_ row: ModelRow) {
+        let route = proxyRoute(for: row)
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(route, forType: .string)
+        status = "Скопировано: \(route)"
     }
 
     func selection(for row: ModelRow) -> ProxySelection {
@@ -1230,11 +1235,17 @@ struct ContentView: View {
                     HStack(alignment: .top, spacing: 5) {
                         VStack(alignment: .leading, spacing: 2) {
                             Text(row.displayName).lineLimit(1)
-                            Text(store.proxyPath(for: row))
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                                .lineLimit(1)
-                                .truncationMode(.middle)
+                            Button {
+                                store.copyProxyRoute(row)
+                            } label: {
+                                Text(store.proxyRoute(for: row))
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                    .lineLimit(1)
+                                    .truncationMode(.middle)
+                            }
+                            .buttonStyle(.borderless)
+                            .help("Нажмите, чтобы скопировать путь модели")
                         }
                         Image(systemName: metadataIcon(row))
                             .font(.caption)
@@ -1308,6 +1319,11 @@ struct ContentView: View {
                 .buttonStyle(.bordered)
                 .padding(.vertical, 6)
 
+                Spacer()
+
+                Text("Выбрано: \(store.selectedModels.count)")
+                    .fontWeight(.medium)
+
                 Button {
                     store.configureZCode()
                 } label: {
@@ -1317,11 +1333,6 @@ struct ContentView: View {
                 .padding(.vertical, 6)
                 .disabled(store.selectedModels.isEmpty || store.isLoading)
                 .help("Создать или обновить провайдера ZCode из всех отмеченных моделей")
-
-                Spacer()
-
-                Text("Выбрано: \(store.selectedModels.count)")
-                    .fontWeight(.medium)
 
                 Button("Применить и перезапустить Codex") {
                     store.applySelection()
