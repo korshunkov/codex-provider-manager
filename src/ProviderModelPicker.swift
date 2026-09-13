@@ -425,6 +425,17 @@ final class ModelStore: ObservableObject {
         }
     }
 
+    func startProxyForLaunch() {
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            let result = Self.runProcess(self?.cliURL, arguments: ["proxy", "start", "--refresh"])
+            if case .failure(.message(let error)) = result {
+                DispatchQueue.main.async {
+                    self?.status = "Прокси недоступен: \(error)"
+                }
+            }
+        }
+    }
+
     func loadPowerWatchState() {
         guard !isPowerWatchBusy else { return }
         DispatchQueue.global(qos: .utility).async { [weak self] in
@@ -1349,6 +1360,7 @@ struct ContentView: View {
         }
         .task {
             store.restoreUICache()
+            store.startProxyForLaunch()
             store.loadProxyState()
             store.loadProviderSettings {
                 if !store.hasCachedList {

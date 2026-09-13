@@ -962,6 +962,10 @@ def write_codex_catalog(
         entry["priority"] = priority
         entry["visibility"] = "list"
         entry["supported_in_api"] = True
+        # Agent tasks must use an effort supported by third-party models.
+        if provider_id and provider_id != "codex-sale":
+            entry["multi_agent_version"] = entry.get("multi_agent_version") or "v1"
+            entry["multi_agent_reasoning_effort"] = entry.get("multi_agent_reasoning_effort") or "low"
         entry["availability_nux"] = None
         entry["upgrade"] = None
         catalog_models.append(entry)

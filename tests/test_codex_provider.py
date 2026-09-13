@@ -256,6 +256,39 @@ class CodexProviderProxyLifecycleTests(unittest.TestCase):
         popen.assert_not_called()
         self.assertEqual(self.pid_path.read_text(encoding="ascii"), "4242\n")
 
+    def test_start_proxy_refresh_restarts_current_proxy(self) -> None:
+        self.pid_path.write_text("4242\n", encoding="ascii")
+        run = self.fake_subprocess_run("", {4242: "python3 codex-provider-proxy"})
+        events: list[tuple] = []
+
+        def fake_kill(pid: int, sig: int) -> None:
+            events.append(("kill", pid, sig))
+            if sig == 0:
+                raise ProcessLookupError
+
+        def popen(*args, **kwargs) -> mock.MagicMock:
+            events.append(("popen", args))
+            process = mock.MagicMock()
+            process.pid = 5555
+            return process
+
+        with mock.patch.object(codex_provider.subprocess, "run", side_effect=run), mock.patch.object(
+            codex_provider.os, "kill", side_effect=fake_kill
+        ), mock.patch.object(codex_provider.subprocess, "Popen", side_effect=popen), mock.patch.object(
+            codex_provider.urllib.request, "urlopen", self.fake_urlopen(200)
+        ):
+            self.assertTrue(codex_provider.start_proxy(refresh=True))
+
+        self.assertEqual(events[0], ("kill", 4242, signal.SIGTERM))
+        self.assertEqual(self.pid_path.read_text(encoding="ascii"), "5555\n")
+
+    def test_pid_check_rejects_similarly_named_process(self) -> None:
+        run = self.fake_subprocess_run(
+            "4242\n", {4242: "python3 codex-provider-proxy-helper --port 8765"}
+        )
+        with mock.patch.object(codex_provider.subprocess, "run", side_effect=run):
+            self.assertIsNone(codex_provider.discover_proxy_pid())
+
     def test_start_proxy_starts_fresh_when_nothing_listens(self) -> None:
         run = self.fake_subprocess_run("", {})
         with mock.patch.object(codex_provider.subprocess, "run", side_effect=run), mock.patch.object(

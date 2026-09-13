@@ -681,7 +681,7 @@ def apply_proxy_configuration(
     if updated != current:
         write_config(updated, backup=True)
     save_state(MODEL_STATE_PATH, state)
-    start_proxy()
+    start_proxy(refresh=True)
     return warnings, active_proxy_id
 
 
@@ -701,7 +701,10 @@ def pid_belongs_to_proxy(pid: int) -> bool:
         )
     except (OSError, subprocess.SubprocessError):
         return False
-    return PROXY_SCRIPT_NAME in result.stdout
+    command = result.stdout.strip()
+    # Match the executable token, so similarly named foreign processes cannot
+    # be mistaken for ours (for example codex-provider-proxy-helper).
+    return bool(re.search(rf"(?:^|\s|/){re.escape(PROXY_SCRIPT_NAME)}(?:\s|$)", command))
 
 
 def discover_proxy_pid() -> int | None:
@@ -778,14 +781,16 @@ def terminate_proxy_process(pid: int) -> None:
         pass
 
 
-def start_proxy() -> bool:
-    if proxy_file_pid() is not None:
+def start_proxy(*, refresh: bool = False) -> bool:
+    file_pid = proxy_file_pid()
+    current_pid = proxy_process_pid()
+    if current_pid is not None and file_pid is not None and not refresh:
         return False
-    # PID-файл может отсутствовать или быть устаревшим, а порт держать старый
-    # процесс прокси. Остановим его, чтобы запустить актуальную версию скрипта.
-    orphan_pid = discover_proxy_pid()
-    if orphan_pid is not None:
-        terminate_proxy_process(orphan_pid)
+    # Перезапускаем только процесс, подтверждённый по точной командной строке.
+    # Чужой процесс на этом порту оставляем нетронутым и сообщаем об ошибке ниже.
+    if current_pid is not None:
+        terminate_proxy_process(current_pid)
+        PROXY_PID_PATH.unlink(missing_ok=True)
     script = PROXY_SCRIPT_PATH
     if not script.exists():
         script = Path(__file__).with_name(PROXY_SCRIPT_NAME)
@@ -811,6 +816,11 @@ def start_proxy() -> bool:
                     return True
         except (urllib.error.URLError, TimeoutError, OSError):
             time.sleep(0.1)
+    PROXY_PID_PATH.unlink(missing_ok=True)
+    try:
+        terminate_proxy_process(process.pid)
+    except Exception:
+        pass
     raise SystemExit("Прокси не ответил после запуска. Подробности: provider-proxy.log")
 
 
@@ -1003,7 +1013,7 @@ def command_proxy_status(_: argparse.Namespace) -> None:
 
 
 def command_proxy_start(_: argparse.Namespace) -> None:
-    started = start_proxy()
+    started = start_proxy(refresh=_.refresh)
     print("Прокси запущен." if started else "Прокси уже работает.")
 
 
@@ -1515,6 +1525,11 @@ def build_parser() -> argparse.ArgumentParser:
     proxy_select.add_argument("--refresh", action="store_true")
     proxy_select.set_defaults(handler=command_proxy_select)
     proxy_start = proxy_subcommands.add_parser("start", help="запустить прокси")
+    proxy_start.add_argument(
+        "--refresh",
+        action="store_true",
+        help="перезапустить только принадлежащий этому менеджеру прокси",
+    )
     proxy_start.set_defaults(handler=command_proxy_start)
     proxy_stop = proxy_subcommands.add_parser("stop", help="остановить прокси")
     proxy_stop.set_defaults(handler=command_proxy_stop)

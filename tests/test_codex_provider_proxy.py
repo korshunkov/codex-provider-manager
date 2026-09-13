@@ -1,6 +1,7 @@
 import importlib.util
 import io
 import json
+import tempfile
 from importlib.machinery import SourceFileLoader
 import unittest
 from pathlib import Path
@@ -19,6 +20,79 @@ spec.loader.exec_module(codex_provider_proxy)
 
 
 class CodexProviderProxyTests(unittest.TestCase):
+    def test_every_post_is_journaled_before_endpoint_validation(self):
+        handler = object.__new__(codex_provider_proxy.ProxyHandler)
+        handler.path = "/unsupported?token=must-not-be-logged"
+        handler.headers = Message()
+        handler.rfile = io.BytesIO(b"")
+        sent = []
+        handler.send_json = lambda payload, status=200: sent.append((payload, status))
+
+        original = codex_provider_proxy.write_diagnostic
+        events = []
+        codex_provider_proxy.write_diagnostic = events.append
+        try:
+            handler.do_POST()
+        finally:
+            codex_provider_proxy.write_diagnostic = original
+
+        self.assertEqual(sent[0][1], 404)
+        self.assertEqual(events[0], {
+            "event": "request_received",
+            "endpoint": "/unsupported",
+        })
+        self.assertNotIn("token=must-not-be-logged", json.dumps(events))
+
+    def test_diagnostics_redact_request_content_and_secrets(self):
+        request = {
+            "model": "am/model",
+            "instructions": "SECRET_INSTRUCTIONS",
+            "input": [{"type": "function_call", "call_id": "call-1",
+                       "name": "read_file", "arguments": "SECRET_ARGUMENTS",
+                       "encrypted_content": "SECRET_ENCRYPTED"}],
+            "tools": [{"type": "function", "name": "read_file",
+                       "namespace": "files"}],
+            "Authorization": "Bearer SECRET_AUTH",
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            original = codex_provider_proxy.DIAGNOSTICS_PATH
+            codex_provider_proxy.DIAGNOSTICS_PATH = Path(directory) / "diagnostics.jsonl"
+            try:
+                codex_provider_proxy.write_diagnostic(
+                    codex_provider_proxy.diagnostic_request(request, "/responses", 123)
+                )
+                raw = codex_provider_proxy.DIAGNOSTICS_PATH.read_text()
+            finally:
+                codex_provider_proxy.DIAGNOSTICS_PATH = original
+        self.assertIn("am/model", raw)
+        self.assertIn("read_file", raw)
+        self.assertIn("call-1", raw)
+        for secret in ("SECRET_INSTRUCTIONS", "SECRET_ARGUMENTS",
+                       "SECRET_ENCRYPTED", "SECRET_AUTH"):
+            self.assertNotIn(secret, raw)
+
+    def test_diagnostics_rotate_by_age_and_size(self):
+        with tempfile.TemporaryDirectory() as directory:
+            original = codex_provider_proxy.DIAGNOSTICS_PATH
+            original_max = codex_provider_proxy.DIAGNOSTICS_MAX_BYTES
+            codex_provider_proxy.DIAGNOSTICS_PATH = Path(directory) / "diagnostics.jsonl"
+            codex_provider_proxy.DIAGNOSTICS_MAX_BYTES = 500
+            try:
+                codex_provider_proxy.DIAGNOSTICS_PATH.write_text(
+                    json.dumps({"ts": 0, "event": "old"}) + "\n"
+                    + json.dumps({"ts": 9999999999, "event": "keep"}) + "\n"
+                )
+                codex_provider_proxy.write_diagnostic({"event": "new", "model": "m"})
+                diagnostic_path = codex_provider_proxy.DIAGNOSTICS_PATH
+                lines = diagnostic_path.read_text().splitlines()
+                size = diagnostic_path.stat().st_size
+            finally:
+                codex_provider_proxy.DIAGNOSTICS_PATH = original
+                codex_provider_proxy.DIAGNOSTICS_MAX_BYTES = original_max
+        self.assertLessEqual(size, 500)
+        self.assertNotIn('"event":"old"', lines)
+        self.assertIn('"event":"new"', lines[-1])
+
     def test_proxy_names_use_short_provider_prefixes(self):
         self.assertEqual(codex_provider_proxy.proxy_model_id("a6api", "kimi-k3"), "a6/kimi-k3")
         self.assertEqual(codex_provider_proxy.proxy_model_id("openrouter-all", "z-ai/glm-5.3"), "or/z-ai/glm-5.3")
