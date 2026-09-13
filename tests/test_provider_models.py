@@ -374,6 +374,33 @@ class ProviderModelsTests(unittest.TestCase):
         self.assertFalse(entry["supports_image_detail_original"])
         self.assertNotIn("tool_mode", entry)
 
+    @patch("provider_models._bundled_catalog")
+    def test_catalog_models_are_sorted_alphabetically(self, bundled_catalog) -> None:
+        from provider_models import write_codex_catalog
+
+        bundled_catalog.return_value = {"models": [{
+            "slug": "gpt-5.4",
+            "description": "template",
+            "default_reasoning_level": "medium",
+            "supported_reasoning_levels": [{"effort": "medium", "description": "medium"}],
+        }]}
+        selected = [model("a6/zeta"), model("a6/alpha"), model("am/beta")]
+        selected[0]["provider_label"] = "A6 API"
+        selected[0]["provider_model_id"] = "zeta"
+        selected[1]["provider_label"] = "A6 API"
+        selected[1]["provider_model_id"] = "alpha"
+        selected[2]["provider_label"] = "AnyModel"
+        selected[2]["provider_model_id"] = "beta"
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "catalog.json"
+            write_codex_catalog(path, selected, Path("/fake/codex"), "proxy")
+            entries = json.loads(path.read_text(encoding="utf-8"))["models"]
+        self.assertEqual([entry["slug"] for entry in entries], [
+            "a6/alpha",
+            "a6/zeta",
+            "am/beta",
+        ])
+
 
 if __name__ == "__main__":
     unittest.main()

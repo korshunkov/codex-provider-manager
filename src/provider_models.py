@@ -904,8 +904,10 @@ def write_codex_catalog(
     catalog_models = []
     ordered_shelf = sorted(
         shelf,
-        key=lambda model: _codex_index(model) or float("-inf"),
-        reverse=True,
+        key=lambda model: (
+            _catalog_display_name(model).casefold(),
+            model["id"].casefold(),
+        ),
     )
     for priority, model in enumerate(ordered_shelf, start=1):
         source = bundled_by_slug.get(model["id"])
