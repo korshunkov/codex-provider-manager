@@ -124,8 +124,9 @@ class ProviderModelsTests(unittest.TestCase):
         )
         self.assertEqual(
             _catalog_display_name(shelf[0]),
-            "a6/kimi-k3 | 62.0 | 52",
+            "A6 API kimi-k3",
         )
+        self.assertEqual(_catalog_display_name(shelf[1]), "OpenRouter z-ai/glm-5.3")
 
     def test_proxy_catalog_adds_active_but_not_automatic_favorites(self) -> None:
         state = {
@@ -363,9 +364,9 @@ class ProviderModelsTests(unittest.TestCase):
             write_codex_catalog(path, [selected], Path("/fake/codex"), "anymodel")
             entry = json.loads(path.read_text(encoding="utf-8"))["models"][0]
         self.assertEqual(entry["supported_reasoning_levels"], [
-            {"effort": "max", "description": "Максимальная глубина рассуждений"},
-            {"effort": "high", "description": "Глубокие рассуждения для сложных задач"},
             {"effort": "low", "description": "Быстрый ответ с лёгкими рассуждениями"},
+            {"effort": "high", "description": "Глубокие рассуждения для сложных задач"},
+            {"effort": "max", "description": "Максимальная глубина рассуждений"},
         ])
         self.assertFalse(entry["supports_search_tool"])
         self.assertNotIn("web_search_tool_type", entry)

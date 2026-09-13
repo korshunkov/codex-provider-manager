@@ -293,27 +293,14 @@ def _codex_index(model: dict[str, Any]) -> float | None:
     return agentic * 0.5 + coding * 0.3 + intelligence * 0.2
 
 
-def _codex_value(model: dict[str, Any], index: float | None) -> float | None:
-    """Codex score divided by the 80/20 blended token price."""
-    input_price = _positive_float(model.get("input_price_per_million"))
-    output_price = _positive_float(model.get("output_price_per_million"))
-    if index is None or input_price is None or output_price is None:
-        return None
-    weighted_cost = input_price * 0.8 + output_price * 0.2
-    return index / weighted_cost if weighted_cost > 0 else None
+REASONING_LEVEL_ORDER = {level: index for index, level in enumerate(KNOWN_REASONING_LEVELS)}
 
 
 def _catalog_display_name(model: dict[str, Any]) -> str:
-    """Show routing name first, then quality and price efficiency."""
-    index = _codex_index(model)
-    value = _codex_value(model, index)
-    prices = (
-        _positive_float(model.get("input_price_per_million")),
-        _positive_float(model.get("output_price_per_million")),
-    )
-    value_text = f"{value:.0f}" if value is not None else "∞" if index is not None and prices == (0.0, 0.0) else "—"
-    index_text = f"{index:.1f}" if index is not None else "—"
-    return f"{model['id']} | {index_text} | {value_text}"
+    """Show a human-readable provider and model name in Codex."""
+    model_name = str(model.get("provider_model_id") or model["id"])
+    provider_label = str(model.get("provider_label") or "").strip()
+    return f"{provider_label} {model_name}".strip()
 
 
 def build_proxy_shelf(
@@ -334,6 +321,7 @@ def build_proxy_shelf(
         ):
             selected.append(item)
 
+    providers = provider_definitions(state)
     shelf: list[dict[str, Any]] = []
     for item in selected:
         provider_id = item["provider_id"]
@@ -350,6 +338,8 @@ def build_proxy_shelf(
             continue
         external_model = dict(model)
         external_model["id"] = proxy_model_id(provider_id, model_id)
+        external_model["provider_model_id"] = model_id
+        external_model["provider_label"] = providers.get(provider_id, {}).get("label", provider_id)
         if not any(existing["id"] == external_model["id"] for existing in shelf):
             shelf.append(external_model)
     shelf.sort(
@@ -930,7 +920,10 @@ def write_codex_catalog(
         entry["default_reasoning_level"] = model["default_reasoning_level"]
         entry["supported_reasoning_levels"] = [
             {"effort": level, "description": REASONING_DESCRIPTIONS[level]}
-            for level in model["reasoning_levels"]
+            for level in sorted(
+                model["reasoning_levels"],
+                key=lambda level: REASONING_LEVEL_ORDER.get(level, len(REASONING_LEVEL_ORDER)),
+            )
         ]
         entry["input_modalities"] = model["input_modalities"]
         entry["context_window"] = model["context_window"]
