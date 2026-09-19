@@ -79,6 +79,112 @@ class CodexProviderTests(unittest.TestCase):
         self.assertEqual(list(provider["models"]), ["a6/gpt-5.6-terra"])
         self.assertEqual(config["provider"]["other"]["models"], {"old": {}})
 
+    def test_mavis_provider_is_created_and_model_list_is_replaced(self) -> None:
+        config = {"provider": {"minimax": {"name": "MiniMax", "models": {"old": {}}}}}
+        selections = [
+            {"provider_id": "a6api", "model_id": "gpt-5.6-terra", "proxy_id": "a6/gpt-5.6-terra"},
+            {"provider_id": "openrouter-all", "model_id": "z-ai/glm-5.3", "proxy_id": "or/z-ai/glm-5.3"},
+        ]
+        models = {
+            "a6api": {
+                "gpt-5.6-terra": {
+                    "context_window": 200_000,
+                    "input_modalities": ["text", "image"],
+                    "reasoning_levels": ["low", "medium", "high"],
+                    "display_name": "GPT-5.6 Terra",
+                }
+            },
+            "openrouter-all": {
+                "z-ai/glm-5.3": {
+                    "context_window": 100_000,
+                    "input_modalities": ["text"],
+                    "reasoning_levels": ["medium"],
+                    "display_name": "GLM 5.3",
+                }
+            },
+        }
+        config, provider_key = codex_provider.upsert_mavis_provider(
+            config, selections, models
+        )
+
+        provider = config["provider"][provider_key]
+        self.assertEqual(provider_key, "codex-provider-manager")
+        self.assertEqual(provider["npm"], codex_provider.MAVIS_NPM_PACKAGE)
+        self.assertEqual(provider["options"]["baseURL"], codex_provider.PROXY_BASE_URL)
+        self.assertEqual(list(provider["models"]), [item["proxy_id"] for item in selections])
+        entry = provider["models"]["a6/gpt-5.6-terra"]
+        self.assertEqual(entry["limit"]["context"], 200_000)
+        self.assertEqual(entry["limit"]["output"], 131_072)
+        self.assertEqual(entry["modalities"]["input"], ["text", "image"])
+        self.assertTrue(entry["attachment"])
+        self.assertTrue(entry["reasoning"])
+        self.assertTrue(entry["temperature"])
+        self.assertTrue(entry["tool_call"])
+        text_entry = provider["models"]["or/z-ai/glm-5.3"]
+        self.assertFalse(text_entry["attachment"])
+        self.assertEqual(text_entry["limit"]["output"], 100_000)
+        # Existing unrelated providers must stay untouched.
+        self.assertEqual(config["provider"]["minimax"]["models"], {"old": {}})
+
+        selections = [selections[0]]
+        config, provider_key = codex_provider.upsert_mavis_provider(
+            config, selections, models
+        )
+        provider = config["provider"][provider_key]
+        self.assertEqual(list(provider["models"]), ["a6/gpt-5.6-terra"])
+        self.assertEqual(config["provider"]["minimax"]["models"], {"old": {}})
+
+    def test_mavis_provider_is_found_by_base_url_across_renames(self) -> None:
+        config = {
+            "provider": {
+                "renamed-by-user": {
+                    "name": "Мой локальный прокси",
+                    "npm": codex_provider.MAVIS_NPM_PACKAGE,
+                    "options": {"apiKey": "custom", "baseURL": codex_provider.PROXY_BASE_URL},
+                    "models": {},
+                }
+            }
+        }
+        selections = [
+            {"provider_id": "a6api", "model_id": "gpt-5.6-terra", "proxy_id": "a6/gpt-5.6-terra"},
+        ]
+        models = {
+            "a6api": {
+                "gpt-5.6-terra": {
+                    "context_window": 200_000,
+                    "input_modalities": ["text"],
+                    "reasoning_levels": ["medium"],
+                    "display_name": "GPT-5.6 Terra",
+                }
+            },
+        }
+        config, provider_key = codex_provider.upsert_mavis_provider(
+            config, selections, models
+        )
+        self.assertEqual(provider_key, "renamed-by-user")
+        provider = config["provider"][provider_key]
+        self.assertEqual(provider["name"], "Мой локальный прокси")
+        self.assertEqual(provider["options"]["apiKey"], "custom")
+
+    def test_mavis_model_entry_falls_back_to_safe_defaults(self) -> None:
+        entry = codex_provider._mavis_model_entry(None, None)
+        self.assertEqual(entry["limit"]["context"], 128_000)
+        self.assertEqual(entry["limit"]["output"], 128_000)
+        self.assertEqual(entry["modalities"]["input"], ["text"])
+        self.assertFalse(entry["attachment"])
+        self.assertFalse(entry["reasoning"])
+
+        model = {
+            "context_window": 0,
+            "input_modalities": [],
+            "reasoning_levels": [],
+            "display_name": "",
+        }
+        entry = codex_provider._mavis_model_entry(model, None)
+        self.assertEqual(entry["limit"]["context"], 128_000)
+        self.assertEqual(entry["limit"]["output"], 128_000)
+        self.assertEqual(entry["modalities"]["input"], ["text"])
+
 
 class CodexProviderProxyLifecycleTests(unittest.TestCase):
     def setUp(self) -> None:
