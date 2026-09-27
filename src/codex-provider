@@ -1408,6 +1408,7 @@ def _test_streaming_response(
         started = time.monotonic()
         first_chunk_at: float | None = None
         completed = False
+        data_chunks = 0
         with urllib.request.urlopen(request, timeout=45) as response:
             for raw_line in response:
                 if not raw_line:
@@ -1418,19 +1419,25 @@ def _test_streaming_response(
                 if completed_marker in line:
                     completed = True
                 if line.startswith("data:"):
+                    data_chunks += 1
                     usage, output_tokens = _extract_stream_usage(
                         line[len("data:"):].strip(), api_mode
                     )
                     if output_tokens:
                         latency_ms = int((first_chunk_at - started) * 1000)
                         total_ms = int((time.monotonic() - started) * 1000)
-                        tps = output_tokens / max(total_ms - latency_ms, 1) * 1000
+                        generation_ms = max(total_ms - latency_ms, 0)
+                        # Tokens-per-second is only meaningful when the answer
+                        # actually streamed; a single buffered chunk yields
+                        # absurd values like 490000 t/s.
+                        reliable = generation_ms >= 250 and data_chunks >= 3
                         metrics = {
                             "latency_ms": latency_ms,
                             "total_ms": total_ms,
                             "output_tokens": output_tokens,
-                            "tps": round(tps, 1),
                         }
+                        if reliable:
+                            metrics["tps"] = round(output_tokens / generation_ms * 1000, 1)
                         if usage:
                             metrics["input_tokens"] = usage.get("input_tokens") or usage.get("prompt_tokens") or 0
         if not completed:

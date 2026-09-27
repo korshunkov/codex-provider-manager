@@ -219,7 +219,7 @@ struct ModelTestMetrics: Codable, Hashable {
     let latencyMs: Int
     let totalMs: Int
     let outputTokens: Int
-    let tps: Double
+    let tps: Double?
 
     enum CodingKeys: String, CodingKey {
         case latencyMs = "latency_ms"
@@ -232,8 +232,9 @@ struct ModelTestMetrics: Codable, Hashable {
         String(format: "%.1f", Double(latencyMs) / 1000)
     }
 
-    var tpsText: String {
-        String(format: "%.0f", tps)
+    var tpsText: String? {
+        guard let tps else { return nil }
+        return String(format: "%.0f", tps)
     }
 }
 
@@ -293,7 +294,7 @@ struct ProviderSettingsResponse: Decodable {
 }
 
 struct UICacheFile: Codable {
-    var version = 3
+    var version = 4
     var lists: [String: [CachedModelRow]] = [:]
     var tests: [String: RowTestState] = [:]
     var metrics: [String: ModelTestMetrics] = [:]
@@ -1201,7 +1202,11 @@ final class ModelStore: ObservableObject {
                         let decoded = try JSONDecoder().decode(ModelTestResponse.self, from: output)
                         if decoded.ok {
                             if let metrics = decoded.metrics {
-                                self.status = "Проверка пройдена: первый токен через \(metrics.latencyText) с, \(metrics.tpsText) токенов/с."
+                                if let tps = metrics.tpsText {
+                                    self.status = "Проверка пройдена: первый токен через \(metrics.latencyText) с, \(tps) токенов/с."
+                                } else {
+                                    self.status = "Проверка пройдена: первый токен через \(metrics.latencyText) с (ответ пришёл без потока, скорость не измерена)."
+                                }
                             } else {
                                 self.status = "Проверка пройдена: \(decoded.message)"
                             }
@@ -1488,7 +1493,10 @@ struct ContentView: View {
     @ViewBuilder
     private static func successLabel(metrics: ModelTestMetrics?) -> String {
         guard let metrics else { return "OK" }
-        return "OK · \(metrics.latencyText)с · \(metrics.tpsText) t/s"
+        if let tps = metrics.tpsText {
+            return "OK · \(metrics.latencyText)с · \(tps) t/s"
+        }
+        return "OK · \(metrics.latencyText)с"
     }
 
     private static func successTooltip(metrics: ModelTestMetrics?) -> String {
@@ -1496,11 +1504,14 @@ struct ContentView: View {
             return "Проверка пройдена. Нажмите, чтобы проверить снова."
         }
         let seconds = String(format: "%.1f", Double(metrics.totalMs) / 1000)
-        return """
-        Первый токен: \(metrics.latencyText) с. \
-        Полный ответ: \(seconds) с, \(metrics.outputTokens) токенов (скорость генерации \(metrics.tpsText) т/с, \
-        reasoning-токены учитываются). Нажмите, чтобы проверить снова.
-        """
+        var lines = ["Первый токен: \(metrics.latencyText) с.", "Полный ответ: \(seconds) с, \(metrics.outputTokens) токенов."]
+        if let tps = metrics.tpsText {
+            lines.append("Скорость генерации: \(tps) т/с (reasoning-токены учитываются).")
+        } else {
+            lines.append("Скорость не измерена: ответ пришёл без потоковой передачи.")
+        }
+        lines.append("Нажмите, чтобы проверить снова.")
+        return lines.joined(separator: "\n")
     }
 
     @ViewBuilder

@@ -411,12 +411,38 @@ if __name__ == "__main__":
 
 class StreamMetricsTests(unittest.TestCase):
     def _chat_sse(self) -> list[bytes]:
+        # Multi-chunk stream; chunk boundaries carry an artificial delay so
+        # generation time exceeds the 250 ms reliability threshold.
+        import time as _time
+
         chunks = [
             b'data: {"choices":[{"delta":{"content":"ok"}}]}',
             b"",
             b'data: {"choices":[{"delta":{"content":"1 2 3 4 5"}}]}',
             b"",
             b'data: {"choices":[],"usage":{"prompt_tokens":12,"completion_tokens":37,"total_tokens":49}}',
+            b"",
+            b"data: [DONE]",
+            b"",
+        ]
+
+        class DelayedLines:
+            def __init__(self, payload: list[bytes]) -> None:
+                self._lines = payload
+
+            def __iter__(self):
+                for index, line in enumerate(self._lines):
+                    if index == 2:
+                        _time.sleep(0.3)
+                    yield line
+
+        return DelayedLines([chunk + b"\n" for chunk in chunks])
+
+    def _chat_sse_single_chunk(self) -> list[bytes]:
+        # Buffered provider: everything in one chunk, generation time ~0.
+        chunks = [
+            b'data: {"choices":[{"delta":{"content":"ok 1 2 3 4 5"}}],'
+            b'"usage":{"prompt_tokens":12,"completion_tokens":37}}',
             b"",
             b"data: [DONE]",
             b"",
@@ -480,9 +506,22 @@ class StreamMetricsTests(unittest.TestCase):
         self.assertIsNone(error)
         self.assertIsNotNone(metrics)
         self.assertEqual(metrics["output_tokens"], 37)
-        self.assertEqual(metrics["latency_ms"], 0)
-        self.assertEqual(metrics["total_ms"], 0)
+        self.assertIn("tps", metrics)
         self.assertGreater(metrics["tps"], 0)
+
+    def test_stream_single_chunk_has_no_tps(self) -> None:
+        with mock.patch.object(
+            codex_provider.urllib.request,
+            "urlopen",
+            self._fake_urlopen(self._chat_sse_single_chunk()),
+        ):
+            error, metrics = codex_provider._test_streaming_response(
+                "https://example.test/v1", "key", "m1", "low", "chat"
+            )
+        self.assertIsNone(error)
+        self.assertIsNotNone(metrics)
+        self.assertEqual(metrics["output_tokens"], 37)
+        self.assertNotIn("tps", metrics)
 
     def test_stream_metrics_responses(self) -> None:
         with mock.patch.object(
