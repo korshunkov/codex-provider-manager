@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 import datetime as dt
 import json
@@ -90,6 +91,8 @@ DEFAULT_PROVIDERS = {
 }
 ANYMODEL_BASE_PRICE_PER_MILLION = 0.05
 A6_MARKETPLACE_PRICES_URL = "https://a6api.com/api/marketplace/public/channels/search?offset=0&limit=10000"
+OPENROUTER_ENDPOINT_STATS_THREADS = 8
+SPEED_STATS_CACHE_ID = "openrouter-endpoint-stats"
 
 
 def _atomic_json_write(path: Path, payload: Any, mode: int = 0o600) -> None:
@@ -586,6 +589,11 @@ def _with_model_fields(model: dict[str, Any], provider_id: str = "") -> dict[str
     model.setdefault("price_is_estimate", False)
     model.setdefault("supports_search_tool", None)
     model.setdefault("supports_function_tools", True)
+    model.setdefault("reference_tps_p50", None)
+    model.setdefault("reference_tps_p90", None)
+    model.setdefault("reference_ttft_ms_p50", None)
+    model.setdefault("reference_ttft_ms_p90", None)
+    model.setdefault("reference_endpoints", [])
     if "context_window_source" not in model:
         # A6 previously stored the generic 128K fallback, so let OpenRouter
         # replace it. Other legacy caches already contained provider data.
@@ -659,6 +667,11 @@ def normalize_model(provider_id: str, item: dict[str, Any]) -> dict[str, Any] | 
         "price_is_estimate": provider_id == "a6api",
         "supports_search_tool": _model_supports_search(item),
         "supports_function_tools": _model_supports_tools(provider_id, item),
+        "reference_tps_p50": None,
+        "reference_tps_p90": None,
+        "reference_ttft_ms_p50": None,
+        "reference_ttft_ms_p90": None,
+        "reference_endpoints": [],
     }
 
 
@@ -764,6 +777,165 @@ def merge_artificial_analysis_from_reference(
             for field in field_names:
                 if model[field] is None:
                     model[field] = matches[0][field]
+        enriched.append(model)
+    return enriched
+
+
+def _percentile_stats(value: Any) -> dict[str, float]:
+    """Normalize one OR PercentileStats object into p50/p90 floats."""
+    if not isinstance(value, dict):
+        return {}
+    stats = {}
+    for key, target in (("p50", "p50"), ("p90", "p90")):
+        number = _positive_float(value.get(key))
+        if number is not None:
+            stats[target] = number
+    return stats
+
+
+def openrouter_speed_stats(endpoints: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """Aggregate throughput/latency percentiles across OR provider endpoints.
+
+    Latency arrives in milliseconds despite what the API docs claim. Models
+    with zero throughput (idle or broken endpoints) are skipped so a dead
+    endpoint cannot drag the average down.
+    """
+    throughputs: list[tuple[float, float]] = []
+    latencies: list[tuple[float, float]] = []
+    names: list[str] = []
+    for endpoint in endpoints:
+        if not isinstance(endpoint, dict):
+            continue
+        name = endpoint.get("provider_name")
+        if not isinstance(name, str) or not name:
+            continue
+        throughput = _percentile_stats(endpoint.get("throughput_last_30m"))
+        latency = _percentile_stats(endpoint.get("latency_last_30m"))
+        if "p50" not in throughput or throughput["p50"] <= 0:
+            continue
+        throughputs.append((throughput["p50"], throughput.get("p90", throughput["p50"])))
+        if "p50" in latency:
+            latencies.append((latency["p50"], latency.get("p90", latency["p50"])))
+        names.append(name)
+    if not throughputs:
+        return None
+    result: dict[str, Any] = {
+        "tps_p50": sum(item[0] for item in throughputs) / len(throughputs),
+        "tps_p90": sum(item[1] for item in throughputs) / len(throughputs),
+        "endpoints": names,
+    }
+    if latencies:
+        result["ttft_ms_p50"] = sum(item[0] for item in latencies) / len(latencies)
+        result["ttft_ms_p90"] = sum(item[1] for item in latencies) / len(latencies)
+    return result
+
+
+def load_openrouter_speed_stats(
+    model_ids: list[str],
+    api_key: str | None,
+    cache_path: Path,
+    *,
+    force: bool = False,
+) -> dict[str, dict[str, Any]]:
+    """Fetch per-model endpoint speed stats, keyed by OR model id.
+
+    OpenRouter has no batch endpoint, so stats come one model at a time;
+    the on-disk cache keeps each entry for CACHE_MAX_AGE_SECONDS and grows
+    incrementally, so only new or stale models are re-requested.
+    """
+    cache = load_json(cache_path, {})
+    if not isinstance(cache, dict):
+        cache = {}
+    cached = cache.get(SPEED_STATS_CACHE_ID, {})
+    entries = cached.get("models", {}) if isinstance(cached, dict) else {}
+    if not isinstance(entries, dict):
+        entries = {}
+    now = dt.datetime.now(tz=dt.timezone.utc).timestamp()
+    wanted = list(dict.fromkeys(model_ids))
+    stale = []
+    for model_id in wanted:
+        entry = entries.get(model_id)
+        fetched_at = entry.get("fetched_at", 0) if isinstance(entry, dict) else 0
+        if force or not isinstance(entry, dict) or not entry.get("stats") or now - float(fetched_at or 0) >= CACHE_MAX_AGE_SECONDS:
+            stale.append(model_id)
+
+    if stale and api_key:
+        # Keep cache writes conservative: bump fetched_at even for models
+        # whose request failed, so a flaky network does not hammer the API.
+        def fetch(model_id: str) -> tuple[str, dict[str, Any] | None]:
+            url = f"https://openrouter.ai/api/v1/models/{model_id}/endpoints"
+            request = urllib.request.Request(
+                url,
+                headers={
+                    "Accept": "application/json",
+                    "Authorization": f"Bearer {api_key}",
+                    "User-Agent": "CodexProviderManager/1.0",
+                },
+            )
+            try:
+                with urllib.request.urlopen(request, timeout=30) as response:
+                    payload = json.load(response)
+            except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError):
+                return model_id, None
+            data = payload.get("data", {}) if isinstance(payload, dict) else {}
+            endpoints = data.get("endpoints", []) if isinstance(data, dict) else []
+            return model_id, {"endpoints": endpoints if isinstance(endpoints, list) else []}
+
+        results = {}
+        with ThreadPoolExecutor(max_workers=OPENROUTER_ENDPOINT_STATS_THREADS) as pool:
+            for model_id, entry in pool.map(fetch, stale):
+                results[model_id] = {"fetched_at": now, "stats": entry}
+        for model_id, entry in results.items():
+            entries[model_id] = entry
+        cache[SPEED_STATS_CACHE_ID] = {"fetched_at": now, "models": entries}
+        _atomic_json_write(cache_path, cache)
+
+    aggregated: dict[str, dict[str, Any]] = {}
+    for model_id in wanted:
+        entry = entries.get(model_id)
+        stats = entry.get("stats") if isinstance(entry, dict) else None
+        if not isinstance(stats, dict):
+            continue
+        aggregated[model_id] = openrouter_speed_stats(stats.get("endpoints") or []) or {}
+    return aggregated
+
+
+def merge_speed_from_reference(
+    models: list[dict[str, Any]],
+    speed_stats: dict[str, dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Attach OR reference speed to models by unambiguous short-name match."""
+    by_short_name: dict[str, list[dict[str, Any]]] = {}
+    for reference_id, stats in speed_stats.items():
+        if not stats:
+            continue
+        short_name = reference_id.rsplit("/", 1)[-1].casefold()
+        by_short_name.setdefault(short_name, []).append(stats)
+
+    enriched = []
+    for model in models:
+        short_name = model["id"].rsplit("/", 1)[-1].casefold()
+        matches = by_short_name.get(short_name, [])
+        if len(matches) != 1:
+            # OR exposes billing variants such as :batch/:free; prefer the
+            # canonical one when several variants share stats.
+            canonical = [
+                reference_id
+                for reference_id, candidate_stats in speed_stats.items()
+                if candidate_stats
+                and reference_id.rsplit("/", 1)[-1].casefold() == short_name
+                and ":" not in reference_id.rsplit("/", 1)[-1]
+            ]
+            if len(canonical) == 1:
+                matches = [speed_stats[canonical[0]]]
+        if len(matches) == 1:
+            stats = matches[0]
+            model = dict(model)
+            model["reference_tps_p50"] = round(stats["tps_p50"], 1)
+            model["reference_tps_p90"] = round(stats["tps_p90"], 1)
+            model["reference_ttft_ms_p50"] = round(stats["ttft_ms_p50"]) if "ttft_ms_p50" in stats else None
+            model["reference_ttft_ms_p90"] = round(stats["ttft_ms_p90"]) if "ttft_ms_p90" in stats else None
+            model["reference_endpoints"] = list(stats.get("endpoints", []))
         enriched.append(model)
     return enriched
 

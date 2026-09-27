@@ -439,7 +439,11 @@ class StreamMetricsTests(unittest.TestCase):
         return DelayedLines([chunk + b"\n" for chunk in chunks])
 
     def _chat_sse_single_chunk(self) -> list[bytes]:
-        # Buffered provider: everything in one chunk, generation time ~0.
+        # Buffered provider: everything in one chunk. A real HTTP read
+        # always takes some time, so the fake delays the payload to keep
+        # total_ms > 0 (estimation branch requires a measurable duration).
+        import time as _time
+
         chunks = [
             b'data: {"choices":[{"delta":{"content":"ok 1 2 3 4 5"}}],'
             b'"usage":{"prompt_tokens":12,"completion_tokens":37}}',
@@ -447,7 +451,18 @@ class StreamMetricsTests(unittest.TestCase):
             b"data: [DONE]",
             b"",
         ]
-        return [chunk + b"\n" for chunk in chunks]
+
+        class DelayedLines:
+            def __init__(self, payload: list[bytes]) -> None:
+                self._lines = payload
+
+            def __iter__(self):
+                for index, line in enumerate(self._lines):
+                    if index == 0:
+                        _time.sleep(0.3)
+                    yield line
+
+        return DelayedLines([chunk + b"\n" for chunk in chunks])
 
     def _responses_sse(self) -> list[bytes]:
         chunks = [
@@ -496,6 +511,53 @@ class StreamMetricsTests(unittest.TestCase):
             (None, 0),
         )
 
+    def test_extract_stream_text_chat(self) -> None:
+        self.assertEqual(
+            codex_provider._extract_stream_text(
+                '{"choices":[{"delta":{"content":"he"}}]}', "chat"
+            ),
+            "he",
+        )
+        self.assertEqual(
+            codex_provider._extract_stream_text(
+                '{"choices":[{"delta":{}}]}', "chat"
+            ),
+            "",
+        )
+        self.assertEqual(codex_provider._extract_stream_text("[DONE]", "chat"), "")
+        self.assertEqual(codex_provider._extract_stream_text("garbage", "chat"), "")
+
+    def test_extract_stream_text_responses(self) -> None:
+        self.assertEqual(
+            codex_provider._extract_stream_text(
+                '{"type":"response.output_text.delta","delta":"hi"}', "responses"
+            ),
+            "hi",
+        )
+        self.assertEqual(
+            codex_provider._extract_stream_text(
+                '{"type":"response.completed","response":{"output":[{"type":"message",'
+                '"content":[{"type":"output_text","text":"a"}]},{"type":"message",'
+                '"content":[{"type":"output_text","text":"b"}]}]}}',
+                "responses",
+            ),
+            "ab",
+        )
+        self.assertEqual(
+            codex_provider._extract_stream_text(
+                '{"type":"response.created"}', "responses"
+            ),
+            "",
+        )
+
+    def test_estimate_tokens_from_text(self) -> None:
+        self.assertEqual(codex_provider.estimate_tokens_from_text(""), 0)
+        self.assertEqual(codex_provider.estimate_tokens_from_text("ok 1 2 3 4 5"), 3)
+        self.assertEqual(codex_provider.estimate_tokens_from_text("a"), 1)
+        self.assertEqual(codex_provider.estimate_tokens_from_text("abcd"), 1)
+        self.assertEqual(codex_provider.estimate_tokens_from_text("abcde"), 1)
+        self.assertEqual(codex_provider.estimate_tokens_from_text("a" * 400), 100)
+
     def test_stream_metrics_chat(self) -> None:
         with mock.patch.object(
             codex_provider.urllib.request, "urlopen", self._fake_urlopen(self._chat_sse())
@@ -509,7 +571,7 @@ class StreamMetricsTests(unittest.TestCase):
         self.assertIn("tps", metrics)
         self.assertGreater(metrics["tps"], 0)
 
-    def test_stream_single_chunk_has_no_tps(self) -> None:
+    def test_stream_single_chunk_estimates_tps_from_text(self) -> None:
         with mock.patch.object(
             codex_provider.urllib.request,
             "urlopen",
@@ -522,6 +584,15 @@ class StreamMetricsTests(unittest.TestCase):
         self.assertIsNotNone(metrics)
         self.assertEqual(metrics["output_tokens"], 37)
         self.assertNotIn("tps", metrics)
+        # "ok 1 2 3 4 5" = 12 characters → estimate of 3 tokens over the
+        # measured total_ms; must be small and finite, not absurd.
+        self.assertIn("estimated_tps", metrics)
+        self.assertGreater(metrics["estimated_tps"], 0)
+        self.assertLess(metrics["estimated_tps"], 1000)
+        self.assertAlmostEqual(
+            metrics["estimated_tps"],
+            round(3 / metrics["total_ms"] * 1000, 1),
+        )
 
     def test_stream_metrics_responses(self) -> None:
         with mock.patch.object(

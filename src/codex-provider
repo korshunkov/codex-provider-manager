@@ -30,9 +30,11 @@ from provider_models import (
     find_model,
     load_state,
     load_a6_marketplace_estimates,
+    load_openrouter_speed_stats,
     merge_a6_marketplace_prices,
     merge_artificial_analysis_from_reference,
     merge_context_window_from_reference,
+    merge_speed_from_reference,
     provider_definition,
     provider_definitions,
     merge_reasoning_from_reference,
@@ -653,6 +655,50 @@ def available_models(provider_id: str, *, force: bool = False) -> list[dict]:
                 models = merge_context_window_from_reference(models, reference_models)
                 models = merge_reasoning_from_reference(models, reference_models)
                 models = merge_artificial_analysis_from_reference(models, reference_models)
+            except RuntimeError:
+                pass
+        if provider_id == "openrouter-all":
+            # Reference speed comes from OR's own per-endpoint stats.
+            try:
+                speed_stats = load_openrouter_speed_stats(
+                    [model["id"] for model in models],
+                    credentials.get("openrouter"),
+                    MODEL_CACHE_PATH,
+                    force=force,
+                )
+                models = merge_speed_from_reference(models, speed_stats)
+            except RuntimeError:
+                pass
+        elif credentials.get("openrouter"):
+            # Third-party gateways get OR speed as advisory metadata only;
+            # it never changes their endpoint, price or behaviour.
+            reference_provider = provider_definition("openrouter-all", state) or PROVIDERS["openrouter-all"]
+            try:
+                reference_models = fetch_models(
+                    "openrouter-reference",
+                    reference_provider,
+                    credentials.get("openrouter"),
+                    MODEL_CACHE_PATH,
+                    force=force,
+                    cache_id="openrouter-reference",
+                )
+                by_short_name: dict[str, str] = {}
+                for reference in reference_models:
+                    by_short_name.setdefault(
+                        reference["id"].rsplit("/", 1)[-1].casefold(), reference["id"]
+                    )
+                wanted_ids = []
+                for model in models:
+                    short_name = model["id"].rsplit("/", 1)[-1].casefold()
+                    if short_name in by_short_name:
+                        wanted_ids.append(by_short_name[short_name])
+                speed_stats = load_openrouter_speed_stats(
+                    wanted_ids,
+                    credentials.get("openrouter"),
+                    MODEL_CACHE_PATH,
+                    force=force,
+                )
+                models = merge_speed_from_reference(models, speed_stats)
             except RuntimeError:
                 pass
         if provider_id == "a6api":
@@ -1409,6 +1455,7 @@ def _test_streaming_response(
         first_chunk_at: float | None = None
         completed = False
         data_chunks = 0
+        stream_text: list[str] = []
         with urllib.request.urlopen(request, timeout=45) as response:
             for raw_line in response:
                 if not raw_line:
@@ -1420,6 +1467,7 @@ def _test_streaming_response(
                     completed = True
                 if line.startswith("data:"):
                     data_chunks += 1
+                    stream_text.append(_extract_stream_text(line[len("data:"):].strip(), api_mode))
                     usage, output_tokens = _extract_stream_usage(
                         line[len("data:"):].strip(), api_mode
                     )
@@ -1438,6 +1486,16 @@ def _test_streaming_response(
                         }
                         if reliable:
                             metrics["tps"] = round(output_tokens / generation_ms * 1000, 1)
+                        elif total_ms > 0:
+                            # Buffered providers return the whole answer in one
+                            # chunk, so real t/s is unmeasurable. Estimate it
+                            # from text volume (1 token ≈ 4 characters) over
+                            # the full request time; expect ±30% accuracy.
+                            estimated = estimate_tokens_from_text("".join(stream_text))
+                            if estimated:
+                                metrics["estimated_tps"] = round(
+                                    estimated / max(total_ms, 1) * 1000, 1
+                                )
                         if usage:
                             metrics["input_tokens"] = usage.get("input_tokens") or usage.get("prompt_tokens") or 0
         if not completed:
@@ -1447,6 +1505,52 @@ def _test_streaming_response(
         return f"Провайдер вернул HTTP {error.code}: {_provider_error_message(error.read())}", None
     except (urllib.error.URLError, TimeoutError, OSError) as error:
         return f"Не удалось связаться с провайдером: {error}", None
+
+
+def _extract_stream_text(data_text: str, api_mode: str) -> str:
+    """Pull visible answer text from one SSE data payload, if any."""
+    if not data_text or data_text == "[DONE]":
+        return ""
+    try:
+        payload = json.loads(data_text)
+    except json.JSONDecodeError:
+        return ""
+    if not isinstance(payload, dict):
+        return ""
+    if api_mode == "chat":
+        choices = payload.get("choices")
+        if isinstance(choices, list) and choices:
+            delta = choices[0].get("delta") if isinstance(choices[0], dict) else None
+            if isinstance(delta, dict) and isinstance(delta.get("content"), str):
+                return delta["content"]
+        return ""
+    kind = payload.get("type")
+    if kind == "response.output_text.delta":
+        return payload.get("delta") if isinstance(payload.get("delta"), str) else ""
+    if kind == "response.completed":
+        response_info = payload.get("response") if isinstance(payload.get("response"), dict) else {}
+        output = response_info.get("output")
+        if isinstance(output, list):
+            parts = []
+            for item in output:
+                if not isinstance(item, dict) or item.get("type") != "message":
+                    continue
+                content = item.get("content")
+                if isinstance(content, list):
+                    for block in content:
+                        if isinstance(block, dict) and block.get("type") == "output_text":
+                            text = block.get("text")
+                            if isinstance(text, str):
+                                parts.append(text)
+            return "".join(parts)
+    return ""
+
+
+def estimate_tokens_from_text(text: str) -> int:
+    """Rough token count: 1 token ≈ 4 characters (English + code bias)."""
+    if not text:
+        return 0
+    return max(1, len(text) // 4)
 
 
 def _extract_stream_usage(data_text: str, api_mode: str) -> tuple[dict | None, int]:

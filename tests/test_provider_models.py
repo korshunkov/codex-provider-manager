@@ -18,11 +18,14 @@ from provider_models import (  # noqa: E402
     _catalog_display_name,
     compaction_selection,
     find_model,
+    load_openrouter_speed_stats,
     merge_a6_marketplace_prices,
     merge_artificial_analysis_from_reference,
     merge_context_window_from_reference,
     merge_reasoning_from_reference,
+    merge_speed_from_reference,
     normalize_model,
+    openrouter_speed_stats,
     proxy_model_id,
     proxy_selections,
     set_compaction_model,
@@ -400,6 +403,128 @@ class ProviderModelsTests(unittest.TestCase):
             "a6/zeta",
             "am/beta",
         ])
+
+
+class OpenRouterSpeedStatsTests(unittest.TestCase):
+    @staticmethod
+    def _endpoint(name: str, tps_p50: float, tps_p90: float, ttft_p50=None, ttft_p90=None) -> dict:
+        endpoint = {
+            "provider_name": name,
+            "throughput_last_30m": {"p50": tps_p50, "p90": tps_p90},
+        }
+        if ttft_p50 is not None:
+            endpoint["latency_last_30m"] = {"p50": ttft_p50, "p90": ttft_p90}
+        return endpoint
+
+    def test_empty_and_dead_endpoints_return_none(self) -> None:
+        self.assertIsNone(openrouter_speed_stats([]))
+        self.assertIsNone(openrouter_speed_stats([
+            {"provider_name": "Dead", "throughput_last_30m": {"p50": 0, "p90": 0}},
+            {"provider_name": "NoStats"},
+        ]))
+
+    def test_throughput_is_averaged_and_zero_endpoints_skipped(self) -> None:
+        stats = openrouter_speed_stats([
+            self._endpoint("Alpha", 40, 60, ttft_p50=500, ttft_p90=900),
+            self._endpoint("Beta", 20, 30, ttft_p50=700, ttft_p90=1100),
+            # Dead endpoint: zero throughput must not drag the average down,
+            # and its missing latency must not break the latency aggregate.
+            {"provider_name": "Idle", "throughput_last_30m": {"p50": 0, "p90": 0}},
+        ])
+        self.assertAlmostEqual(stats["tps_p50"], 30)
+        self.assertAlmostEqual(stats["tps_p90"], 45)
+        self.assertAlmostEqual(stats["ttft_ms_p50"], 600)
+        self.assertAlmostEqual(stats["ttft_ms_p90"], 1000)
+        self.assertEqual(stats["endpoints"], ["Alpha", "Beta"])
+
+    def test_latency_is_optional(self) -> None:
+        stats = openrouter_speed_stats([self._endpoint("Alpha", 40, 60)])
+        self.assertNotIn("ttft_ms_p50", stats)
+        self.assertEqual(stats["tps_p50"], 40)
+
+    def test_merge_by_unique_short_name(self) -> None:
+        target = model("glm/glm-5.3")
+        stats = {"z-ai/glm-5.3": {
+            "tps_p50": 45.0, "tps_p90": 70.0,
+            "ttft_ms_p50": 543.0, "ttft_ms_p90": 1200.0,
+            "endpoints": ["OpenAI"],
+        }}
+        enriched = merge_speed_from_reference([target], stats)
+        self.assertEqual(enriched[0]["reference_tps_p50"], 45.0)
+        self.assertEqual(enriched[0]["reference_tps_p90"], 70.0)
+        self.assertEqual(enriched[0]["reference_ttft_ms_p50"], 543)
+        self.assertEqual(enriched[0]["reference_ttft_ms_p90"], 1200)
+        self.assertEqual(enriched[0]["reference_endpoints"], ["OpenAI"])
+
+    def test_merge_prefers_canonical_over_free_variant(self) -> None:
+        target = model("deep/deepseek-v3")
+        stats = {
+            "deepseek/deepseek-v3": {
+                "tps_p50": 10.0, "tps_p90": 15.0, "endpoints": ["DeepInfra"],
+            },
+            "deepseek/deepseek-v3:free": {
+                "tps_p50": 3.0, "tps_p90": 5.0, "endpoints": ["Chutes"],
+            },
+            # Different model: must not leak into the match.
+            "deepseek/deepseek-r2": {
+                "tps_p50": 99.0, "tps_p90": 99.0, "endpoints": ["Other"],
+            },
+        }
+        enriched = merge_speed_from_reference([target], stats)
+        self.assertEqual(enriched[0]["reference_tps_p50"], 10.0)
+        self.assertEqual(enriched[0]["reference_endpoints"], ["DeepInfra"])
+
+    def test_merge_skips_ambiguous_names(self) -> None:
+        target = model("any/vision-lm")
+        stats = {
+            "a/vision-lm": {"tps_p50": 10.0, "tps_p90": 15.0, "endpoints": ["A"]},
+            "b/vision-lm": {"tps_p50": 20.0, "tps_p90": 25.0, "endpoints": ["B"]},
+        }
+        enriched = merge_speed_from_reference([target], stats)
+        self.assertNotIn("reference_tps_p50", enriched[0])
+
+    def test_speed_stats_cache_roundtrip_and_ttl(self) -> None:
+        endpoint = {
+            "provider_name": "OpenAI",
+            "throughput_last_30m": {"p50": 45, "p90": 60},
+            "latency_last_30m": {"p50": 543, "p90": 900},
+        }
+
+        def fake_urlopen(url, timeout=None):
+            request = url
+            class FakeResponse:
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *args):
+                    return False
+
+                def read(self):
+                    return json.dumps({
+                        "data": {"id": "x", "endpoints": [endpoint]}
+                    }).encode()
+
+            return FakeResponse()
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "cache.json"
+            with patch("provider_models.urllib.request.urlopen", side_effect=fake_urlopen):
+                stats = load_openrouter_speed_stats(
+                    ["openai/gpt-4o"], "key", path
+                )
+            self.assertAlmostEqual(stats["openai/gpt-4o"]["tps_p50"], 45)
+            self.assertAlmostEqual(stats["openai/gpt-4o"]["ttft_ms_p50"], 543)
+            # Second call inside TTL must come from cache, without network.
+            with patch("provider_models.urllib.request.urlopen", side_effect=fake_urlopen) as mocked:
+                stats2 = load_openrouter_speed_stats(
+                    ["openai/gpt-4o"], "key", path
+                )
+            mocked.assert_not_called()
+            self.assertAlmostEqual(stats2["openai/gpt-4o"]["tps_p50"], 45)
+            self.assertEqual(
+                json.loads(path.read_text(encoding="utf-8"))["openrouter-endpoint-stats"]["models"]["openai/gpt-4o"]["stats"]["endpoints"],
+                [endpoint],
+            )
 
 
 if __name__ == "__main__":

@@ -14,6 +14,11 @@ struct ModelRow: Identifiable, Codable, Hashable {
     let intelligenceIndex: Double?
     let codingIndex: Double?
     let agenticIndex: Double?
+    let referenceTpsP50: Double?
+    let referenceTpsP90: Double?
+    let referenceTtftMsP50: Double?
+    let referenceTtftMsP90: Double?
+    let referenceEndpoints: [String]
 
     var providerID: String? = nil
     var providerName: String? = nil
@@ -35,6 +40,11 @@ struct ModelRow: Identifiable, Codable, Hashable {
         case intelligenceIndex = "intelligence_index"
         case codingIndex = "coding_index"
         case agenticIndex = "agentic_index"
+        case referenceTpsP50 = "reference_tps_p50"
+        case referenceTpsP90 = "reference_tps_p90"
+        case referenceTtftMsP50 = "reference_ttft_ms_p50"
+        case referenceTtftMsP90 = "reference_ttft_ms_p90"
+        case referenceEndpoints = "reference_endpoints"
         case providerID
         case providerName
     }
@@ -112,6 +122,11 @@ struct ModelRow: Identifiable, Codable, Hashable {
         intelligenceIndex: Double?,
         codingIndex: Double?,
         agenticIndex: Double?,
+        referenceTpsP50: Double? = nil,
+        referenceTpsP90: Double? = nil,
+        referenceTtftMsP50: Double? = nil,
+        referenceTtftMsP90: Double? = nil,
+        referenceEndpoints: [String] = [],
         providerID: String? = nil,
         providerName: String? = nil
     ) {
@@ -127,6 +142,11 @@ struct ModelRow: Identifiable, Codable, Hashable {
         self.intelligenceIndex = intelligenceIndex
         self.codingIndex = codingIndex
         self.agenticIndex = agenticIndex
+        self.referenceTpsP50 = referenceTpsP50
+        self.referenceTpsP90 = referenceTpsP90
+        self.referenceTtftMsP50 = referenceTtftMsP50
+        self.referenceTtftMsP90 = referenceTtftMsP90
+        self.referenceEndpoints = referenceEndpoints
         self.providerID = providerID
         self.providerName = providerName
     }
@@ -134,50 +154,116 @@ struct ModelRow: Identifiable, Codable, Hashable {
 
 /// Table row wrapper: pairs a model with its test metrics so columns can
 /// sort by measured speed (Swift Table sorts by key paths only).
+///
+/// Speed columns fall back through three sources: a live measurement, an
+/// estimate derived from a buffered response ("≈"), and OpenRouter
+/// reference stats ("OR", gray). Live data always wins.
 struct SpeedRow: Identifiable {
     let row: ModelRow
     let metrics: ModelTestMetrics?
 
     var id: String { row.id }
 
+    private var liveTps: Double? { metrics?.tps ?? metrics?.estimatedTps }
+    private var hasLiveLatency: Bool { metrics != nil }
+    private var hasReference: Bool {
+        row.referenceTpsP50 != nil || row.referenceTtftMsP50 != nil
+    }
+
     var ttftSort: Double {
-        metrics.map { Double($0.latencyMs) } ?? .infinity
+        if let metrics { return Double(metrics.latencyMs) / 1000 }
+        if let ttft = row.referenceTtftMsP50 { return ttft / 1000 }
+        return .infinity
     }
 
     var tpsSort: Double {
-        metrics?.tps ?? -.infinity
+        if let liveTps { return liveTps }
+        if let tps = row.referenceTpsP50 { return tps }
+        return -.infinity
+    }
+
+    var ttftColor: Color {
+        hasLiveLatency ? .primary : .secondary
     }
 
     var ttftText: String {
-        guard let metrics else { return "—" }
-        return "\(metrics.latencyText) с"
+        if let metrics { return "\(metrics.latencyText) с" }
+        if let ttft = row.referenceTtftMsP50 {
+            return String(format: "%.1f", ttft / 1000)
+        }
+        return "—"
     }
 
     var tpsText: String {
-        guard let metrics else { return "—" }
-        guard let tps = metrics.tps else { return "—*" }
-        return String(format: "%.0f", tps)
+        if let tps = metrics?.tps {
+            return String(format: "%.0f", tps)
+        }
+        if let estimated = metrics?.estimatedTps {
+            return "≈" + String(format: "%.0f", estimated)
+        }
+        if let tps = row.referenceTpsP50 {
+            return String(format: "%.0f (OR)", tps)
+        }
+        return metrics == nil ? "—" : "—*"
     }
 
     var tpsColor: Color {
-        guard let tps = metrics?.tps else { return .secondary }
-        if tps >= 40 { return .green }
-        if tps >= 15 { return .primary }
+        if let tps = metrics?.tps {
+            if tps >= 40 { return .green }
+            if tps >= 15 { return .primary }
+            return .secondary
+        }
+        if metrics?.estimatedTps != nil { return .orange }
         return .secondary
     }
 
     var tpsHelp: String {
-        guard let metrics else { return "Модель не тестировалась. Нажмите «Тест»." }
-        guard metrics.tps != nil else {
-            return "Ответ пришёл без потоковой передачи — скорость генерации оценить нельзя."
+        if let metrics {
+            if let tps = metrics.tps {
+                let seconds = String(format: "%.1f", Double(metrics.totalMs) / 1000)
+                return "Первый токен: \(metrics.latencyText) с, полный ответ: \(seconds) с, \(metrics.outputTokens) токенов. У reasoning-моделей в скорости учтены токены размышления."
+            }
+            if let estimated = metrics.estimatedTps {
+                let seconds = String(format: "%.1f", Double(metrics.totalMs) / 1000)
+                return "≈\(String(format: "%.0f", estimated)) ток/с — оценка по объёму ответа: провайдер прислал ответ одним куском без стрима, время генерации измерено точно (\(seconds) с), а токены посчитаны из текста (символы/4). Точность ±30%, живой замер недоступен."
+            }
         }
-        let seconds = String(format: "%.1f", Double(metrics.totalMs) / 1000)
-        return "Первый токен: \(metrics.latencyText) с, полный ответ: \(seconds) с, \(metrics.outputTokens) токенов. У reasoning-моделей в скорости учтены токены размышления."
+        if let tpsP50 = row.referenceTpsP50 {
+            var help = "Справочная скорость OpenRouter (среднее за 30 минут): p50 ≈ \(String(format: "%.0f", tpsP50)) ток/с"
+            if let p90 = row.referenceTpsP90 {
+                help += ", p90 ≈ \(String(format: "%.0f", p90)) ток/с"
+            }
+            help += ". Модель не тестировалась — нажмите «Тест», чтобы измерить живую скорость."
+            if !row.referenceEndpoints.isEmpty {
+                help += " Эндпоинты: \(row.referenceEndpoints.joined(separator: ", "))."
+            }
+            return help
+        }
+        if hasReference {
+            return "Модель не тестировалась — нажмите «Тест». Справочной скорости OpenRouter для неё нет."
+        }
+        return "Модель не тестировалась. Нажмите «Тест»."
     }
 
     var ttftHelp: String {
-        guard metrics != nil else { return "Модель не тестировалась. Нажмите «Тест»." }
-        return "Задержка до первого токена. У reasoning-моделей она естественно больше — они думают до начала ответа."
+        if let metrics {
+            if let estimated = metrics.estimatedTps, metrics.tps == nil {
+                return "Ответ пришёл одним куском (буферизованно), поэтому задержка первого токена не разделяется: показано полное время ответа."
+            }
+            return "Задержка до первого токена. У reasoning-моделей она естественно больше — они думают до начала ответа."
+        }
+        if let ttft = row.referenceTtftMsP50 {
+            var help = "Справочная задержка OpenRouter (среднее за 30 минут): p50 ≈ \(String(format: "%.0f", ttft)) мс"
+            if let p90 = row.referenceTtftMsP90 {
+                help += ", p90 ≈ \(String(format: "%.0f", p90)) мс"
+            }
+            help += "."
+            return help
+        }
+        if hasReference {
+            return "Справочной задержки OpenRouter для неё нет."
+        }
+        return "Модель не тестировалась. Нажмите «Тест»."
     }
 
     var priceSort: Double { row.weightedCost ?? .infinity }
@@ -210,6 +296,11 @@ struct CachedModelRow: Codable {
     let intelligenceIndex: Double?
     let codingIndex: Double?
     let agenticIndex: Double?
+    let referenceTpsP50: Double?
+    let referenceTpsP90: Double?
+    let referenceTtftMsP50: Double?
+    let referenceTtftMsP90: Double?
+    let referenceEndpoints: [String]
     let providerID: String
     let providerName: String?
 
@@ -226,6 +317,11 @@ struct CachedModelRow: Codable {
         case intelligenceIndex = "intelligence_index"
         case codingIndex = "coding_index"
         case agenticIndex = "agentic_index"
+        case referenceTpsP50 = "reference_tps_p50"
+        case referenceTpsP90 = "reference_tps_p90"
+        case referenceTtftMsP50 = "reference_ttft_ms_p50"
+        case referenceTtftMsP90 = "reference_ttft_ms_p90"
+        case referenceEndpoints = "reference_endpoints"
         case providerID = "provider_id"
         case providerName = "provider_name"
     }
@@ -243,6 +339,11 @@ struct CachedModelRow: Codable {
         intelligenceIndex = row.intelligenceIndex
         codingIndex = row.codingIndex
         agenticIndex = row.agenticIndex
+        referenceTpsP50 = row.referenceTpsP50
+        referenceTpsP90 = row.referenceTpsP90
+        referenceTtftMsP50 = row.referenceTtftMsP50
+        referenceTtftMsP90 = row.referenceTtftMsP90
+        referenceEndpoints = row.referenceEndpoints
         providerID = row.providerID ?? "single"
         providerName = row.providerName
     }
@@ -261,6 +362,11 @@ struct CachedModelRow: Codable {
             intelligenceIndex: intelligenceIndex,
             codingIndex: codingIndex,
             agenticIndex: agenticIndex,
+            referenceTpsP50: referenceTpsP50,
+            referenceTpsP90: referenceTpsP90,
+            referenceTtftMsP50: referenceTtftMsP50,
+            referenceTtftMsP90: referenceTtftMsP90,
+            referenceEndpoints: referenceEndpoints,
             providerID: providerID,
             providerName: providerName
         )
@@ -286,12 +392,14 @@ struct ModelTestMetrics: Codable, Hashable {
     let totalMs: Int
     let outputTokens: Int
     let tps: Double?
+    let estimatedTps: Double?
 
     enum CodingKeys: String, CodingKey {
         case latencyMs = "latency_ms"
         case totalMs = "total_ms"
         case outputTokens = "output_tokens"
         case tps
+        case estimatedTps = "estimated_tps"
     }
 
     var latencyText: String {
@@ -360,7 +468,7 @@ struct ProviderSettingsResponse: Decodable {
 }
 
 struct UICacheFile: Codable {
-    var version = 4
+    var version = 5
     var lists: [String: [CachedModelRow]] = [:]
     var tests: [String: RowTestState] = [:]
     var metrics: [String: ModelTestMetrics] = [:]
@@ -1470,7 +1578,7 @@ struct ContentView: View {
                 TableColumn("Первый токен, с", value: \.ttftSort) { speedRow in
                     Text(speedRow.ttftText)
                         .monospacedDigit()
-                        .foregroundStyle(speedRow.metrics == nil ? Color.secondary : Color.primary)
+                        .foregroundStyle(speedRow.ttftColor)
                         .help(speedRow.ttftHelp)
                 }
                 .width(min: 95, ideal: 110)
