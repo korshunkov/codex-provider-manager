@@ -215,10 +215,33 @@ struct ModelResponse: Decodable {
     }
 }
 
+struct ModelTestMetrics: Codable, Hashable {
+    let latencyMs: Int
+    let totalMs: Int
+    let outputTokens: Int
+    let tps: Double
+
+    enum CodingKeys: String, CodingKey {
+        case latencyMs = "latency_ms"
+        case totalMs = "total_ms"
+        case outputTokens = "output_tokens"
+        case tps
+    }
+
+    var latencyText: String {
+        String(format: "%.1f", Double(latencyMs) / 1000)
+    }
+
+    var tpsText: String {
+        String(format: "%.0f", tps)
+    }
+}
+
 struct ModelTestResponse: Decodable {
     let ok: Bool
     let message: String
     let attempts: Int?
+    let metrics: ModelTestMetrics?
 }
 
 extension RowTestState {
@@ -270,9 +293,10 @@ struct ProviderSettingsResponse: Decodable {
 }
 
 struct UICacheFile: Codable {
-    var version = 2
+    var version = 3
     var lists: [String: [CachedModelRow]] = [:]
     var tests: [String: RowTestState] = [:]
+    var metrics: [String: ModelTestMetrics] = [:]
 }
 
 struct ProviderOption: Hashable, Identifiable {
@@ -392,6 +416,7 @@ final class ModelStore: ObservableObject {
     @Published var settingsStatus = ""
     @Published var isSettingsBusy = false
     @Published var rowTests: [String: RowTestState] = [:]
+    @Published var rowMetrics: [String: ModelTestMetrics] = [:]
     @Published var keyProviderID: String?
     @Published var visibleProviderKeys: [String: String] = [:]
 
@@ -712,11 +737,15 @@ final class ModelStore: ObservableObject {
         for (key, state) in cache.tests where state != .loading {
             rowTests[key] = state
         }
+        for (key, metrics) in cache.metrics where cache.tests[key] == .success {
+            rowMetrics[key] = metrics
+        }
     }
 
     private func persistUICache() {
         uiCache.lists[providerID] = rows.map(CachedModelRow.init)
         uiCache.tests = rowTests.filter { $0.value != .loading }
+        uiCache.metrics = rowMetrics.filter { rowTests[$0.key] == .success }
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys]
         guard let data = try? encoder.encode(uiCache) else { return }
@@ -749,6 +778,11 @@ final class ModelStore: ObservableObject {
                         self.rowTests[rowID] = decoded.ok
                             ? .success
                             : .error(decoded.message)
+                        if decoded.ok, let metrics = decoded.metrics {
+                            self.rowMetrics[rowID] = metrics
+                        } else if !decoded.ok {
+                            self.rowMetrics.removeValue(forKey: rowID)
+                        }
                         self.persistUICache()
                     } catch {
                         self.rowTests[rowID] = .error("Непонятный ответ проверки: \(error.localizedDescription)")
@@ -1165,7 +1199,15 @@ final class ModelStore: ObservableObject {
                 case .success(let output):
                     do {
                         let decoded = try JSONDecoder().decode(ModelTestResponse.self, from: output)
-                        self.status = decoded.ok ? "Проверка пройдена: \(decoded.message)" : "Проверка не пройдена: \(decoded.message)"
+                        if decoded.ok {
+                            if let metrics = decoded.metrics {
+                                self.status = "Проверка пройдена: первый токен через \(metrics.latencyText) с, \(metrics.tpsText) токенов/с."
+                            } else {
+                                self.status = "Проверка пройдена: \(decoded.message)"
+                            }
+                        } else {
+                            self.status = "Проверка не пройдена: \(decoded.message)"
+                        }
                     } catch {
                         self.status = "Проверка вернула непонятный ответ: \(error.localizedDescription)"
                     }
@@ -1444,19 +1486,40 @@ struct ContentView: View {
     }
 
     @ViewBuilder
+    private static func successLabel(metrics: ModelTestMetrics?) -> String {
+        guard let metrics else { return "OK" }
+        return "OK · \(metrics.latencyText)с · \(metrics.tpsText) t/s"
+    }
+
+    private static func successTooltip(metrics: ModelTestMetrics?) -> String {
+        guard let metrics else {
+            return "Проверка пройдена. Нажмите, чтобы проверить снова."
+        }
+        let seconds = String(format: "%.1f", Double(metrics.totalMs) / 1000)
+        return """
+        Первый токен: \(metrics.latencyText) с. \
+        Полный ответ: \(seconds) с, \(metrics.outputTokens) токенов (скорость генерации \(metrics.tpsText) т/с, \
+        reasoning-токены учитываются). Нажмите, чтобы проверить снова.
+        """
+    }
+
+    @ViewBuilder
     private func rowTestButton(_ row: ModelRow) -> some View {
         switch store.rowTests[row.id] {
         case .loading:
-            ProgressView().controlSize(.small)
+            ProgressView()
+                .controlSize(.small)
         case .success:
             Button {
                 store.testRow(row)
             } label: {
-                Text("OK").frame(maxWidth: 44)
+                Text(Self.successLabel(metrics: store.rowMetrics[row.id]))
+                    .font(.system(.caption, design: .monospaced))
+                    .frame(maxWidth: 130)
             }
             .buttonStyle(.bordered)
             .controlSize(.small)
-            .help("Проверка пройдена. Нажмите, чтобы проверить снова.")
+            .help(Self.successTooltip(metrics: store.rowMetrics[row.id]))
         case .error(let message):
             HStack(spacing: 4) {
                 Button {

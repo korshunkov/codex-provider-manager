@@ -407,3 +407,104 @@ class CodexProviderProxyLifecycleTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class StreamMetricsTests(unittest.TestCase):
+    def _chat_sse(self) -> list[bytes]:
+        chunks = [
+            b'data: {"choices":[{"delta":{"content":"ok"}}]}',
+            b"",
+            b'data: {"choices":[{"delta":{"content":"1 2 3 4 5"}}]}',
+            b"",
+            b'data: {"choices":[],"usage":{"prompt_tokens":12,"completion_tokens":37,"total_tokens":49}}',
+            b"",
+            b"data: [DONE]",
+            b"",
+        ]
+        return [chunk + b"\n" for chunk in chunks]
+
+    def _responses_sse(self) -> list[bytes]:
+        chunks = [
+            b'data: {"type":"response.output_text.delta","delta":"ok"}',
+            b"",
+            b'data: {"type":"response.completed","response":{"usage":{"input_tokens":9,"output_tokens":44,"total_tokens":53}}}',
+            b"",
+        ]
+        return [chunk + b"\n" for chunk in chunks]
+
+    def _fake_urlopen(self, lines: list[bytes]):
+        class FakeResponse:
+            def __init__(self, payload: list[bytes]) -> None:
+                self._lines = payload
+
+            def __iter__(self):
+                return iter(self._lines)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+        return lambda request, timeout=None: FakeResponse(lines)
+
+    def test_extract_chat_usage(self) -> None:
+        usage, tokens = codex_provider._extract_stream_usage(
+            '{"choices":[],"usage":{"prompt_tokens":12,"completion_tokens":37}}', "chat"
+        )
+        self.assertEqual(tokens, 37)
+        self.assertEqual(usage["prompt_tokens"], 12)
+
+    def test_extract_responses_usage(self) -> None:
+        usage, tokens = codex_provider._extract_stream_usage(
+            '{"type":"response.completed","response":{"usage":{"output_tokens":44}}}', "responses"
+        )
+        self.assertEqual(tokens, 44)
+        self.assertEqual(usage["output_tokens"], 44)
+
+    def test_extract_garbage_and_done(self) -> None:
+        self.assertEqual(codex_provider._extract_stream_usage("[DONE]", "chat"), (None, 0))
+        self.assertEqual(codex_provider._extract_stream_usage("not json", "chat"), (None, 0))
+        self.assertEqual(
+            codex_provider._extract_stream_usage('{"type":"response.output_text.delta"}', "responses"),
+            (None, 0),
+        )
+
+    def test_stream_metrics_chat(self) -> None:
+        with mock.patch.object(
+            codex_provider.urllib.request, "urlopen", self._fake_urlopen(self._chat_sse())
+        ):
+            error, metrics = codex_provider._test_streaming_response(
+                "https://example.test/v1", "key", "m1", "low", "chat"
+            )
+        self.assertIsNone(error)
+        self.assertIsNotNone(metrics)
+        self.assertEqual(metrics["output_tokens"], 37)
+        self.assertEqual(metrics["latency_ms"], 0)
+        self.assertEqual(metrics["total_ms"], 0)
+        self.assertGreater(metrics["tps"], 0)
+
+    def test_stream_metrics_responses(self) -> None:
+        with mock.patch.object(
+            codex_provider.urllib.request, "urlopen", self._fake_urlopen(self._responses_sse())
+        ):
+            error, metrics = codex_provider._test_streaming_response(
+                "https://example.test/v1", "key", "m1", "low", "responses"
+            )
+        self.assertIsNone(error)
+        self.assertIsNotNone(metrics)
+        self.assertEqual(metrics["output_tokens"], 44)
+
+    def test_stream_without_usage_still_ok(self) -> None:
+        lines = [
+            b'data: {"choices":[{"delta":{"content":"ok"}}]}\n',
+            b"data: [DONE]\n",
+        ]
+        with mock.patch.object(
+            codex_provider.urllib.request, "urlopen", self._fake_urlopen(lines)
+        ):
+            error, metrics = codex_provider._test_streaming_response(
+                "https://example.test/v1", "key", "m1", "low", "chat"
+            )
+        self.assertIsNone(error)
+        self.assertIsNone(metrics)

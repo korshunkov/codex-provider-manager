@@ -78,6 +78,7 @@ DISPLAY_NAME = "OpenAI"
 # switching the upstream service does not split new sessions into groups.
 SESSION_PROVIDER_ID = "codex-sale"
 COMPATIBILITY_TEST_ATTEMPTS = 1
+COMPATIBILITY_TEST_PROMPT = "Ответь 'ok', затем числа от 1 до 20 через пробел."
 
 PROVIDERS = DEFAULT_PROVIDERS
 
@@ -1365,27 +1366,32 @@ def _test_streaming_response(
     model_id: str,
     reasoning_effort: str,
     api_mode: str = "responses",
-) -> str | None:
-    """Return an error message, or None after a complete streaming response."""
+) -> tuple[str | None, dict | None]:
+    """Run a streaming test request.
+
+    Return (error_message, metrics). error_message is None after a complete
+    streaming response; metrics is None when the provider did not report usage.
+    """
     if api_mode == "chat":
         request_body = {
             "model": model_id,
-            "messages": [{"role": "user", "content": "Ответь ровно одним словом: ok"}],
-            "max_tokens": 16,
+            "messages": [{"role": "user", "content": COMPATIBILITY_TEST_PROMPT}],
+            "max_tokens": 160,
             "stream": True,
+            "stream_options": {"include_usage": True},
         }
         endpoint = "/chat/completions"
-        completed_marker = b"[DONE]"
+        completed_marker = "[DONE]"
     else:
         request_body = {
             "model": model_id,
-            "input": "Ответь ровно одним словом: ok",
-            "max_output_tokens": 16,
+            "input": COMPATIBILITY_TEST_PROMPT,
+            "max_output_tokens": 160,
             "stream": True,
             "reasoning": {"effort": reasoning_effort},
         }
         endpoint = "/responses"
-        completed_marker = b"response.completed"
+        completed_marker = "response.completed"
     request = urllib.request.Request(
         f"{base_url.rstrip('/')}{endpoint}",
         data=json.dumps(request_body).encode("utf-8"),
@@ -1398,15 +1404,62 @@ def _test_streaming_response(
         method="POST",
     )
     try:
+        metrics: dict | None = None
+        started = time.monotonic()
+        first_chunk_at: float | None = None
+        completed = False
         with urllib.request.urlopen(request, timeout=45) as response:
-            payload = response.read()
-        if completed_marker not in payload:
-            return "Потоковый ответ оборвался до завершения."
-        return None
+            for raw_line in response:
+                if not raw_line:
+                    continue
+                if first_chunk_at is None:
+                    first_chunk_at = time.monotonic()
+                line = raw_line.decode("utf-8", "replace").strip()
+                if completed_marker in line:
+                    completed = True
+                if line.startswith("data:"):
+                    usage, output_tokens = _extract_stream_usage(
+                        line[len("data:"):].strip(), api_mode
+                    )
+                    if output_tokens:
+                        latency_ms = int((first_chunk_at - started) * 1000)
+                        total_ms = int((time.monotonic() - started) * 1000)
+                        tps = output_tokens / max(total_ms - latency_ms, 1) * 1000
+                        metrics = {
+                            "latency_ms": latency_ms,
+                            "total_ms": total_ms,
+                            "output_tokens": output_tokens,
+                            "tps": round(tps, 1),
+                        }
+                        if usage:
+                            metrics["input_tokens"] = usage.get("input_tokens") or usage.get("prompt_tokens") or 0
+        if not completed:
+            return "Потоковый ответ оборвался до завершения.", None
+        return None, metrics
     except urllib.error.HTTPError as error:
-        return f"Провайдер вернул HTTP {error.code}: {_provider_error_message(error.read())}"
+        return f"Провайдер вернул HTTP {error.code}: {_provider_error_message(error.read())}", None
     except (urllib.error.URLError, TimeoutError, OSError) as error:
-        return f"Не удалось связаться с провайдером: {error}"
+        return f"Не удалось связаться с провайдером: {error}", None
+
+
+def _extract_stream_usage(data_text: str, api_mode: str) -> tuple[dict | None, int]:
+    """Pull usage and output-token count from one SSE data payload, if any."""
+    if not data_text or data_text == "[DONE]":
+        return None, 0
+    try:
+        payload = json.loads(data_text)
+    except json.JSONDecodeError:
+        return None, 0
+    if not isinstance(payload, dict):
+        return None, 0
+    if api_mode == "chat":
+        usage = payload.get("usage") if isinstance(payload.get("usage"), dict) else None
+        return usage, int((usage or {}).get("completion_tokens") or 0)
+    if payload.get("type") != "response.completed":
+        return None, 0
+    response_info = payload.get("response") if isinstance(payload.get("response"), dict) else {}
+    usage = response_info.get("usage") if isinstance(response_info.get("usage"), dict) else None
+    return usage, int((usage or {}).get("output_tokens") or 0)
 
 
 def command_test_model(args: argparse.Namespace) -> None:
@@ -1436,8 +1489,9 @@ def command_test_model(args: argparse.Namespace) -> None:
 
     reasoning_effort = selected["default_reasoning_level"]
     errors: list[str] = []
+    metrics: dict | None = None
     for attempt in range(1, COMPATIBILITY_TEST_ATTEMPTS + 1):
-        error = _test_streaming_response(
+        error, attempt_metrics = _test_streaming_response(
             str(PROVIDERS[provider_id]["base_url"]),
             api_key,
             selected["id"],
@@ -1446,12 +1500,16 @@ def command_test_model(args: argparse.Namespace) -> None:
         )
         if error:
             errors.append(f"попытка {attempt}: {error}")
+        elif attempt_metrics:
+            metrics = attempt_metrics
 
     if errors:
         result["message"] = f"Потоковый запрос не прошёл: {'; '.join(errors)}"
     else:
         result["ok"] = True
         result["message"] = "Модель ответила на короткий потоковый запрос."
+        if metrics:
+            result["metrics"] = metrics
     print(json.dumps(result, ensure_ascii=False))
 
 
