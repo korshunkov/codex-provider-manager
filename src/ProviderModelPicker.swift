@@ -42,6 +42,7 @@ struct ModelRow: Identifiable, Codable, Hashable {
     var nameSort: String { displayName.lowercased() }
     var inputSort: Double { inputPrice ?? .infinity }
     var outputSort: Double { outputPrice ?? .infinity }
+
     /// Codex-weighted Artificial Analysis score: agent work matters most,
     /// then coding, then general reasoning.
     var codexIndex: Double? {
@@ -128,6 +129,71 @@ struct ModelRow: Identifiable, Codable, Hashable {
         self.agenticIndex = agenticIndex
         self.providerID = providerID
         self.providerName = providerName
+    }
+}
+
+/// Table row wrapper: pairs a model with its test metrics so columns can
+/// sort by measured speed (Swift Table sorts by key paths only).
+struct SpeedRow: Identifiable {
+    let row: ModelRow
+    let metrics: ModelTestMetrics?
+
+    var id: String { row.id }
+
+    var ttftSort: Double {
+        metrics.map { Double($0.latencyMs) } ?? .infinity
+    }
+
+    var tpsSort: Double {
+        metrics?.tps ?? -.infinity
+    }
+
+    var ttftText: String {
+        guard let metrics else { return "—" }
+        return "\(metrics.latencyText) с"
+    }
+
+    var tpsText: String {
+        guard let metrics else { return "—" }
+        guard let tps = metrics.tps else { return "—*" }
+        return String(format: "%.0f", tps)
+    }
+
+    var tpsColor: Color {
+        guard let tps = metrics?.tps else { return .secondary }
+        if tps >= 40 { return .green }
+        if tps >= 15 { return .primary }
+        return .secondary
+    }
+
+    var tpsHelp: String {
+        guard let metrics else { return "Модель не тестировалась. Нажмите «Тест»." }
+        guard metrics.tps != nil else {
+            return "Ответ пришёл без потоковой передачи — скорость генерации оценить нельзя."
+        }
+        let seconds = String(format: "%.1f", Double(metrics.totalMs) / 1000)
+        return "Первый токен: \(metrics.latencyText) с, полный ответ: \(seconds) с, \(metrics.outputTokens) токенов. У reasoning-моделей в скорости учтены токены размышления."
+    }
+
+    var ttftHelp: String {
+        guard metrics != nil else { return "Модель не тестировалась. Нажмите «Тест»." }
+        return "Задержка до первого токена. У reasoning-моделей она естественно больше — они думают до начала ответа."
+    }
+
+    var priceSort: Double { row.weightedCost ?? .infinity }
+    var priceText: String {
+        switch (row.inputPrice, row.outputPrice) {
+        case let (input?, output?):
+            let format = { (value: Double) in value == 0 ? "0" : String(format: "%.2f", value) }
+            return "\(format(input)) / \(format(output))"
+        case (let input?, nil): return Self.priceCell(input)
+        case (nil, let output?): return Self.priceCell(output)
+        default: return "—"
+        }
+    }
+
+    private static func priceCell(_ value: Double) -> String {
+        value == 0 ? "0" : String(format: "%.2f", value)
     }
 }
 
@@ -1276,14 +1342,14 @@ struct ContentView: View {
     @StateObject private var store = ModelStore()
     @State private var searchText = ""
     @State private var priceFilter: PriceFilter = .all
-    @State private var sortOrder = [KeyPathComparator(\ModelRow.valueSort, order: .reverse)]
+    @State private var sortOrder = [KeyPathComparator(\SpeedRow.row.valueSort, order: .reverse)]
     @State private var showSettings = false
 
     private var visibleSelectionKeys: Set<String> {
-        Set(filteredRows.map { "\($0.providerID ?? "single")|\($0.modelID)" })
+        Set(filteredRows.map(\.id))
     }
 
-    private var filteredRows: [ModelRow] {
+    private var filteredRows: [SpeedRow] {
         let words = searchText.split(separator: " ").map { $0.lowercased() }
         return store.rows.filter { row in
             let haystack = "\(row.displayName) \(row.modelID) \(row.modelDescription) \(row.providerName ?? "")".lowercased()
@@ -1296,7 +1362,12 @@ struct ContentView: View {
             case .free: matchesFilter = row.inputPrice == 0 || row.outputPrice == 0
             }
             return matchesText && matchesFilter
-        }.sorted(using: sortOrder)
+        }
+        .map { row in
+            let key = row.providerID.map { "\($0)|\(row.modelID)" } ?? row.id
+            return SpeedRow(row: row, metrics: store.rowMetrics[key])
+        }
+        .sorted(using: sortOrder)
     }
 
     var body: some View {
@@ -1331,31 +1402,31 @@ struct ContentView: View {
             .background(.bar)
 
             Table(filteredRows, selection: $store.selectedRowID, sortOrder: $sortOrder) {
-                TableColumn("") { row in
+                TableColumn("") { speedRow in
                     Toggle(
                         "",
                         isOn: Binding(
-                            get: { store.isSelected(row) },
-                            set: { enabled in store.setSelection(row, enabled: enabled) }
+                            get: { store.isSelected(speedRow.row) },
+                            set: { enabled in store.setSelection(speedRow.row, enabled: enabled) }
                         )
                     )
                     .labelsHidden()
                 }
                 .width(34)
 
-                TableColumn("Провайдер", value: \.providerNameSort) { row in
-                    Text(row.providerName ?? "—").lineLimit(2)
+                TableColumn("Провайдер", value: \.row.providerNameSort) { speedRow in
+                    Text(speedRow.row.providerName ?? "—").lineLimit(2)
                 }
                 .width(min: 120, ideal: 150)
 
-                TableColumn("Модель", value: \.nameSort) { row in
+                TableColumn("Модель", value: \.row.nameSort) { speedRow in
                     HStack(alignment: .top, spacing: 5) {
                         VStack(alignment: .leading, spacing: 2) {
-                            Text(row.displayName).lineLimit(1)
+                            Text(speedRow.row.displayName).lineLimit(1)
                             Button {
-                                store.copyProxyRoute(row)
+                                store.copyProxyRoute(speedRow.row)
                             } label: {
-                                Text(store.proxyRoute(for: row))
+                                Text(store.proxyRoute(for: speedRow.row))
                                     .font(.caption)
                                     .foregroundStyle(.secondary)
                                     .lineLimit(1)
@@ -1364,45 +1435,58 @@ struct ContentView: View {
                             .buttonStyle(.borderless)
                             .help("Нажмите, чтобы скопировать путь модели")
                         }
-                        Image(systemName: metadataIcon(row))
+                        Image(systemName: metadataIcon(speedRow.row))
                             .font(.caption)
-                            .foregroundStyle(metadataColor(row))
-                            .help(row.metadataHelp)
+                            .foregroundStyle(metadataColor(speedRow.row))
+                            .help(speedRow.row.metadataHelp)
                     }
                 }
                 .width(min: 220, ideal: 310)
 
-                TableColumn("Вход $/M", value: \.inputSort) { row in
-                    Text(row.inputText).monospacedDigit()
+                TableColumn("Цена $/M", value: \.priceSort) { speedRow in
+                    Text(speedRow.priceText)
+                        .monospacedDigit()
+                        .help("Вход / выход, $ за миллион токенов. Сортировка по взвешенной цене (80% вход + 20% выход).")
                 }
-                .width(min: 80, ideal: 100)
+                .width(min: 90, ideal: 110)
 
-                TableColumn("Выход $/M", value: \.outputSort) { row in
-                    Text(row.outputText).monospacedDigit()
-                }
-                .width(min: 80, ideal: 100)
-
-                TableColumn("Индекс Codex", value: \.indexSort) { row in
-                    Text(row.indexText).monospacedDigit()
+                TableColumn("Индекс Codex", value: \.row.indexSort) { speedRow in
+                    Text(speedRow.row.indexText).monospacedDigit()
                 }
                 .width(min: 100, ideal: 120)
 
-                TableColumn("Выгодность", value: \.valueSort) { row in
-                    Text(row.valueText)
+                TableColumn("Выгодность", value: \.row.valueSort) { speedRow in
+                    Text(speedRow.row.valueText)
                         .monospacedDigit()
-                        .foregroundStyle(row.isTopFree ? .yellow : .primary)
+                        .foregroundStyle(speedRow.row.isTopFree ? .yellow : .primary)
                 }
                 .width(min: 90, ideal: 105)
 
-                TableColumn("Контекст", value: \.contextSort) { row in
-                    Text(row.contextText).monospacedDigit()
+                TableColumn("Контекст", value: \.row.contextSort) { speedRow in
+                    Text(speedRow.row.contextText).monospacedDigit()
                 }
                 .width(min: 75, ideal: 90)
 
-                TableColumn("Тест") { row in
-                    rowTestButton(row)
+                TableColumn("Первый токен, с", value: \.ttftSort) { speedRow in
+                    Text(speedRow.ttftText)
+                        .monospacedDigit()
+                        .foregroundStyle(speedRow.metrics == nil ? Color.secondary : Color.primary)
+                        .help(speedRow.ttftHelp)
                 }
-                .width(min: 74, ideal: 84)
+                .width(min: 95, ideal: 110)
+
+                TableColumn("Ток/с", value: \.tpsSort) { speedRow in
+                    Text(speedRow.tpsText)
+                        .monospacedDigit()
+                        .foregroundStyle(speedRow.tpsColor)
+                        .help(speedRow.tpsHelp)
+                }
+                .width(min: 60, ideal: 72)
+
+                TableColumn("Тест") { speedRow in
+                    rowTestButton(speedRow.row)
+                }
+                .width(min: 74)
             }
             .overlay(alignment: .topLeading) {
                 Button {
