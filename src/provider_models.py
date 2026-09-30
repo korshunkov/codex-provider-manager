@@ -1069,10 +1069,7 @@ def write_codex_catalog(
 ) -> None:
     bundled = _bundled_catalog(codex_binary)
     bundled_by_slug = {model.get("slug"): model for model in bundled["models"] if isinstance(model, dict)}
-    # Older Codex model metadata exposes regular function tools. This is more
-    # compatible with third-party models than the code-mode-only tool wrapper
-    # used by the newest OpenAI models.
-    fallback = bundled_by_slug.get("gpt-5.4") or bundled["models"][0]
+    fallback = bundled["models"][0]
     catalog_models = []
     ordered_shelf = sorted(
         shelf,
@@ -1099,6 +1096,8 @@ def write_codex_catalog(
                 key=lambda level: REASONING_LEVEL_ORDER.get(level, len(REASONING_LEVEL_ORDER)),
             )
         ]
+        # The installed Codex version owns the request/tool contract. Keep its
+        # required schema fields instead of carrying stale model metadata.
         entry["input_modalities"] = model["input_modalities"]
         entry["context_window"] = model["context_window"]
         entry["max_context_window"] = model["context_window"]
