@@ -75,7 +75,11 @@ MAVIS_BACKUP_PREFIX = "config-before-codex-provider"
 MAVIS_BACKUP_DIRECTORY = MAVIS_CONFIG_PATH.parent / "backups"
 PROXY_TARGET_ID = "__proxy__"
 CODEX_BINARY = Path(
-    os.environ.get("CODEX_CLI_PATH", str(Path.home() / ".local" / "bin" / "codex"))
+    os.environ.get(
+        "CODEX_CLI_PATH",
+        "/Applications/ChatGPT.app/Contents/Resources/codex-cli/"
+        "CodexCLI.app/Contents/MacOS/codex",
+    )
 )
 DISPLAY_NAME = "OpenAI"
 # Codex writes this identifier into every session. It must remain stable so
