@@ -414,18 +414,22 @@ def _reasoning_details(provider_id: str, item: dict[str, Any]) -> tuple[list[str
     return ["medium"], "medium", "fallback"
 
 
-def _input_modalities(item: dict[str, Any]) -> list[str]:
+def _input_modalities_details(item: dict[str, Any]) -> tuple[list[str], str]:
     architecture = item.get("architecture")
     if isinstance(architecture, dict):
         modalities = architecture.get("input_modalities")
         if isinstance(modalities, list):
             selected = [value for value in ("text", "image") if value in modalities]
             if selected:
-                return selected
+                return selected, "provider"
     capabilities = item.get("capabilities")
     if isinstance(capabilities, dict) and capabilities.get("vision"):
-        return ["text", "image"]
-    return ["text"]
+        return ["text", "image"], "provider"
+    return ["text"], "missing"
+
+
+def _input_modalities(item: dict[str, Any]) -> list[str]:
+    return _input_modalities_details(item)[0]
 
 
 def _context_details(provider_id: str, item: dict[str, Any]) -> tuple[int, str]:
@@ -577,6 +581,13 @@ def merge_a6_marketplace_prices(
 def _with_model_fields(model: dict[str, Any], provider_id: str = "") -> dict[str, Any]:
     """Keep model caches created before pricing metadata readable."""
     model = dict(model)
+    if "input_modalities_source" not in model:
+        # Older caches did not record where image support came from. Text-only
+        # entries are likely an omitted provider field; image entries already
+        # came from useful provider metadata.
+        model["input_modalities_source"] = (
+            "missing" if model.get("input_modalities") == ["text"] else "provider"
+        )
     had_reasoning_source = "reasoning_levels_source" in model
     model.setdefault("context_window", 128000)
     model.setdefault("context_window_source", "fallback")
@@ -653,6 +664,7 @@ def normalize_model(provider_id: str, item: dict[str, Any]) -> dict[str, Any] | 
         "context_window": context_window,
         "context_window_source": context_source,
         "input_modalities": _input_modalities(item),
+        "input_modalities_source": _input_modalities_details(item)[1],
         "reasoning_levels": levels,
         "default_reasoning_level": default_level,
         "reasoning_levels_source": levels_source,
@@ -740,6 +752,42 @@ def merge_reasoning_from_reference(
                 model["reasoning_levels"] = list(matches[0]["reasoning_levels"])
                 model["default_reasoning_level"] = matches[0]["default_reasoning_level"]
                 model["reasoning_levels_source"] = "openrouter"
+        enriched.append(model)
+    return enriched
+
+
+def merge_input_modalities_from_reference(
+    models: list[dict[str, Any]], reference_models: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Fill omitted image support from a unique OpenRouter match."""
+    by_short_name: dict[str, list[dict[str, Any]]] = {}
+    for reference in reference_models:
+        modalities = reference.get("input_modalities")
+        if not isinstance(modalities, list) or not modalities:
+            continue
+        short_name = reference["id"].rsplit("/", 1)[-1].casefold()
+        by_short_name.setdefault(short_name, []).append(reference)
+
+    enriched = []
+    for model in models:
+        source = model.get("input_modalities_source")
+        eligible = source in ("missing", "reference", None)
+        if eligible:
+            short_name = model["id"].rsplit("/", 1)[-1].casefold()
+            matches = by_short_name.get(short_name, [])
+            if len(matches) != 1:
+                # Prefer the canonical model over :free/:batch variants.
+                canonical = [
+                    reference
+                    for reference in matches
+                    if ":" not in reference["id"].rsplit("/", 1)[-1]
+                ]
+                if len(canonical) == 1:
+                    matches = canonical
+            if len(matches) == 1:
+                model = dict(model)
+                model["input_modalities"] = list(matches[0]["input_modalities"])
+                model["input_modalities_source"] = "openrouter"
         enriched.append(model)
     return enriched
 

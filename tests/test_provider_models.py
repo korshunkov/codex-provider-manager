@@ -22,6 +22,7 @@ from provider_models import (  # noqa: E402
     merge_a6_marketplace_prices,
     merge_artificial_analysis_from_reference,
     merge_context_window_from_reference,
+    merge_input_modalities_from_reference,
     merge_reasoning_from_reference,
     merge_speed_from_reference,
     normalize_model,
@@ -299,6 +300,25 @@ class ProviderModelsTests(unittest.TestCase):
         enriched = merge_reasoning_from_reference([normalized], [reference])
         self.assertEqual(enriched[0]["reasoning_levels"], ["low", "medium"])
         self.assertEqual(enriched[0]["default_reasoning_level"], "low")
+
+    def test_image_support_is_filled_from_unique_openrouter_reference(self) -> None:
+        a6_model = normalize_model("a6api", {"id": "glm-5.3-flash"})
+        reference = model("z-ai/glm-5.3-flash")
+        reference["input_modalities"] = ["text", "image"]
+        enriched = merge_input_modalities_from_reference([a6_model], [reference])
+        self.assertEqual(enriched[0]["input_modalities"], ["text", "image"])
+        self.assertEqual(enriched[0]["input_modalities_source"], "openrouter")
+
+    def test_provider_image_metadata_is_not_replaced(self) -> None:
+        provider_model = normalize_model("vibecode", {
+            "id": "kimi-k3",
+            "architecture": {"input_modalities": ["text"]},
+        })
+        reference = model("moonshotai/kimi-k3")
+        reference["input_modalities"] = ["text", "image"]
+        enriched = merge_input_modalities_from_reference([provider_model], [reference])
+        self.assertEqual(enriched[0]["input_modalities"], ["text"])
+        self.assertEqual(enriched[0]["input_modalities_source"], "provider")
 
     def test_search_support_can_be_read_from_openrouter_parameters(self) -> None:
         normalized = normalize_model("openrouter-all", {
